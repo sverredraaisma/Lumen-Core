@@ -1,0 +1,83 @@
+lumen 1
+
+# Palettes — stdlib v1
+#
+# The eight named palettes every effect can assume exist. Without them the first
+# five minutes with the language are spent writing a gradient before anything can
+# be shown on a light, which is a poor introduction.
+#
+# Stops interpolate in **oklab** unless a palette says otherwise, so a two-stop
+# ramp passes through the colours a person would have picked for the middle
+# rather than through the mud that linear RGB gives. `rainbow` is the exception:
+# it declares `oklch`, because a hue sweep is the one case where interpolating
+# the hue angle is exactly what is wanted, and oklab would cut a chord straight
+# through the grey axis instead.
+#
+# Resolution costs nothing at runtime — stops are baked into a lookup table at
+# compile time — so the choice of space is purely about how the ramp looks.
+
+palette warm {
+  0.0  #2a0f00
+  0.35 #b23c05
+  0.7  #ff9538
+  1.0  #ffe6bd
+}
+
+palette cool {
+  0.0  #00121f
+  0.35 #0a4f7a
+  0.7  #34a8d8
+  1.0  #d5f2ff
+}
+
+palette ocean {
+  0.0  #00131c
+  0.3  #04364a
+  0.6  #0b7e86
+  0.85 #4fc3a1
+  1.0  #dff5e4
+}
+
+palette fire {
+  0.0  #000000
+  0.25 #6e0b00
+  0.5  #d93a02
+  0.75 #ffa41b
+  1.0  #fff3c4
+}
+
+palette ice {
+  0.0  #01060f
+  0.3  #123a63
+  0.65 #63b8e8
+  1.0  #f2fbff
+}
+
+# The one palette that interpolates in oklch, so the hue sweeps the long way
+# round instead of desaturating through the middle.
+palette rainbow {
+  space oklch
+  0.0    #ff2b2b
+  0.1667 #ffd12b
+  0.3333 #4be22b
+  0.5    #2bd8d8
+  0.6667 #2b5cff
+  0.8333 #b52bff
+  1.0    #ff2b2b
+}
+
+# Black to white. Trivial, and worth shipping: it is what `palette(mono, v)`
+# means when someone wants a brightness ramp with the same call shape as every
+# other palette lookup.
+palette mono {
+  0.0 #000000
+  1.0 #ffffff
+}
+
+palette sunset {
+  0.0  #150a2b
+  0.25 #61246b
+  0.5  #c14a5a
+  0.75 #ff9153
+  1.0  #ffdda3
+}

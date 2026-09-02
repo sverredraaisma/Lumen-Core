@@ -127,10 +127,29 @@ fn link_stdlib(file: &mut ast::File, diags: &mut Diagnostics) -> bool {
         return false;
     };
 
-    // Palettes first, so a stdlib palette is visible to the effect that follows.
-    for p in lib.palettes {
+    // Palettes first, so a stdlib palette is visible to the effect that
+    // follows. Spans cleared for the same reason as the functions: a library
+    // span points into a file the author cannot see, and `resolve` recognises
+    // the empty span when it explains a name clash.
+    for mut p in lib.palettes {
+        p.span = Span::EMPTY;
         file.decls.push(ast::Decl::Palette(p));
     }
+    // A file-scope `fn` is a top-level declaration in the grammar, but only
+    // effect-item functions were ever registered - so calling one reported
+    // "unknown function" at the call site while the declaration itself was
+    // accepted in silence. A declaration that parses and then does nothing is
+    // the exact failure the "unknown construct is an error" rule exists to
+    // prevent, so they are folded in here alongside the library.
+    let top_level: Vec<ast::FnDecl> = file
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            ast::Decl::Fn(f) => Some(f.clone()),
+            _ => None,
+        })
+        .collect();
+
     for d in &mut file.decls {
         if let ast::Decl::Effect(e) = d {
             // Prepended, so the library is declared first and a clashing user
@@ -151,6 +170,7 @@ fn link_stdlib(file: &mut ast::File, diags: &mut Diagnostics) -> bool {
                     f
                 })
                 .collect();
+            fns.extend(top_level.iter().cloned());
             fns.append(&mut e.fns);
             e.fns = fns;
             break;

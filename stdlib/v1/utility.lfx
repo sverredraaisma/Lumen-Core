@@ -1,0 +1,46 @@
+lumen 1
+
+# Utility — stdlib v1
+#
+# The small conversions that otherwise get written out by hand in every effect,
+# slightly differently each time.
+
+# Linear rescale from one range to another. Extrapolates outside `in_lo..in_hi`;
+# use `remap_clamped` when the input is a sensor and might do anything.
+fn remap(v: float, in_lo: float, in_hi: float, out_lo: float, out_hi: float) -> float {
+  return out_lo + (v - in_lo) * (out_hi - out_lo) / (in_hi - in_lo)
+}
+
+# The same, held at the endpoints. This is the one to reach for on any channel
+# value: a sensor that reports out of range should saturate the effect, not
+# invert it.
+fn remap_clamped(v: float, in_lo: float, in_hi: float, out_lo: float, out_hi: float) -> float {
+  let raw = out_lo + (v - in_lo) * (out_hi - out_lo) / (in_hi - in_lo)
+  return clamp(raw, min(out_lo, out_hi), max(out_lo, out_hi))
+}
+
+# Snap to `steps` bands over 0..1. Posterising a gradient is the difference
+# between a smooth wash and something that reads as deliberate; it also hides
+# Q16 banding by making the banding intentional.
+fn quantize(v: float, steps: float) -> float {
+  return floor(v * steps) / steps
+}
+
+# Move `current` towards `target` at no more than `rate` units per second.
+#
+# `dt` has to be passed in rather than read, because a function is inlined into
+# whichever section its caller sits in and reading `dt` inside would hide that.
+# Passing it makes the frame-rate dependence visible at the call site, which is
+# where the classic "the fade is twice as fast on the 60 fps device" bug is
+# introduced.
+fn slew(current: float, target: float, rate: float, dt: float) -> float {
+  let step_max = rate * dt
+  return current + clamp(target - current, 0 - step_max, step_max)
+}
+
+# Zero below `threshold`, unchanged above it. For a noisy control input — an IMU
+# axis, an audio band with a hissy floor — where small values are all noise and
+# passing them through makes the lights jitter at rest.
+fn deadzone(v: float, threshold: float) -> float {
+  return select(step(threshold, abs(v)), v, 0)
+}

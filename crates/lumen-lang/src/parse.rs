@@ -17,21 +17,24 @@ use alloc::vec::Vec;
 
 use crate::ast::*;
 use crate::diag::{Diagnostic, Diagnostics, Span};
-use crate::lex::{lex, Tok, Token, Unit};
+use crate::lex::{lex_with_comments, Tok, Token, Unit};
 
 /// Parse a `.lfx` source file.
 ///
 /// Returns whatever could be parsed alongside every diagnostic found. Check
 /// [`Diagnostics::has_errors`] before trusting the tree.
 pub fn parse(src: &str) -> (Option<File>, Diagnostics) {
-    let (tokens, lex_errs) = lex(src);
+    let (tokens, comments, lex_errs) = lex_with_comments(src);
     let mut p = Parser {
         toks: tokens,
         at: 0,
         diags: Diagnostics::new(),
     };
     p.diags.extend(lex_errs);
-    let file = p.file();
+    let mut file = p.file();
+    if let Some(f) = file.as_mut() {
+        f.comments = comments;
+    }
     (file, p.diags)
 }
 
@@ -256,6 +259,7 @@ impl Parser {
         Some(File {
             language_version,
             decls,
+            comments: Vec::new(),
             span: start.merge(self.span()),
         })
     }

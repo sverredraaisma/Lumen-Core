@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::diag::Span;
-use crate::lex::Unit;
+use crate::lex::{Comment, Unit};
 
 /// A whole `.lfx` file. Self-contained: no imports, no external references.
 #[derive(Clone, PartialEq, Debug)]
@@ -22,6 +22,14 @@ pub struct File {
     /// The `lumen N` header — the language version.
     pub language_version: u32,
     pub decls: Vec<Decl>,
+    /// Every comment in the file, in source order.
+    ///
+    /// Held on the file rather than attached to nodes because a comment can sit
+    /// anywhere, including places the grammar has no node for — between two
+    /// declarations, after the last one, inside a blank stretch. The formatter
+    /// places them by span, which handles all of those without the AST needing
+    /// a slot for each.
+    pub comments: Vec<Comment>,
     pub span: Span,
 }
 

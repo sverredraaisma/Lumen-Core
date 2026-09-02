@@ -15,23 +15,86 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::ast::*;
+use crate::diag::Span;
+use crate::lex::Comment;
 
 const INDENT: &str = "  ";
+
+/// Emits comments back into the output as their positions come round.
+///
+/// The formatter walks the tree in source order, so a cursor over the comments
+/// is enough: before writing anything at byte `at`, flush every comment that
+/// started earlier. That handles comments in places the grammar has no node
+/// for (between declarations, after the last one, in a blank stretch) without
+/// the AST needing a slot for each.
+struct Comments<'a> {
+    items: &'a [Comment],
+    next: usize,
+}
+
+impl<'a> Comments<'a> {
+    fn new(items: &'a [Comment]) -> Comments<'a> {
+        Comments { items, next: 0 }
+    }
+
+    /// Write out every comment that began before `at`.
+    fn flush_before(&mut self, out: &mut String, at: usize, depth: usize) {
+        while let Some(c) = self.items.get(self.next) {
+            if c.span.start >= at {
+                return;
+            }
+            self.next += 1;
+            // A comment that trailed code goes on its own line here. Keeping it
+            // trailing would need to know which line the code landed on after
+            // reformatting, and a comment on the wrong line reads as explaining
+            // something it does not.
+            indent(out, depth);
+            if c.text.is_empty() {
+                out.push_str("#\n");
+            } else {
+                out.push_str(&format!("# {}\n", c.text));
+            }
+        }
+    }
+
+    /// Everything left, for the end of the file.
+    fn flush_rest(&mut self, out: &mut String) {
+        self.flush_before(out, usize::MAX, 0);
+    }
+}
 
 /// Render a file back to canonical `.lfx` text.
 pub fn format(file: &File) -> String {
     let mut out = String::new();
+    let mut comments = Comments::new(&file.comments);
     out.push_str(&format!("lumen {}\n", file.language_version));
     for d in &file.decls {
+        let span = decl_span(d);
         out.push('\n');
+        comments.flush_before(&mut out, span.start, 0);
         match d {
-            Decl::Effect(e) => effect(&mut out, e),
+            Decl::Effect(e) => effect(&mut out, e, &mut comments),
             Decl::Palette(p) => palette(&mut out, p),
             Decl::Curve(c) => curve(&mut out, c),
             Decl::Fn(f) => fn_decl(&mut out, f, 0),
         }
     }
+    // Whatever trails the last declaration. Dropping it would lose exactly the
+    // comment people write at the bottom of a file to explain the whole thing.
+    if comments.next < comments.items.len() {
+        out.push('\n');
+        comments.flush_rest(&mut out);
+    }
     out
+}
+
+fn decl_span(d: &Decl) -> Span {
+    match d {
+        Decl::Effect(e) => e.span,
+        Decl::Palette(p) => p.span,
+        Decl::Curve(c) => c.span,
+        Decl::Fn(f) => f.span,
+    }
 }
 
 fn indent(out: &mut String, depth: usize) {
@@ -40,7 +103,7 @@ fn indent(out: &mut String, depth: usize) {
     }
 }
 
-fn effect(out: &mut String, e: &Effect) {
+fn effect(out: &mut String, e: &Effect, comments: &mut Comments<'_>) {
     out.push_str(&format!("effect {} {{\n", quote(&e.name)));
 
     // Metadata first, in a fixed order, so two files that differ only in the
@@ -75,6 +138,7 @@ fn effect(out: &mut String, e: &Effect) {
     }
 
     section(out, &e.params, |out, p| {
+        comments.flush_before(out, p.span.start, 1);
         indent(out, 1);
         out.push_str(&format!(
             "param {} : {} = {}",
@@ -98,6 +162,7 @@ fn effect(out: &mut String, e: &Effect) {
     });
 
     section(out, &e.channels, |out, c| {
+        comments.flush_before(out, c.span.start, 1);
         indent(out, 1);
         out.push_str(&format!("channel {} : {}", c.name, chan_type(&c.ty)));
         if let Some(h) = c.hold_ms {
@@ -110,16 +175,19 @@ fn effect(out: &mut String, e: &Effect) {
     });
 
     section(out, &e.lets, |out, b| {
+        comments.flush_before(out, b.span.start, 1);
         indent(out, 1);
         out.push_str(&format!("let {} = {}\n", b.name, expr(&b.value)));
     });
 
     section(out, &e.masks, |out, b| {
+        comments.flush_before(out, b.span.start, 1);
         indent(out, 1);
         out.push_str(&format!("mask {} = {}\n", b.name, expr(&b.value)));
     });
 
     section(out, &e.states, |out, s| {
+        comments.flush_before(out, s.span.start, 1);
         indent(out, 1);
         out.push_str(&format!(
             "state {} : {} = {}\n",
@@ -131,14 +199,19 @@ fn effect(out: &mut String, e: &Effect) {
 
     for f in &e.fns {
         out.push('\n');
+        comments.flush_before(out, f.span.start, 1);
         fn_decl(out, f, 1);
     }
 
     for l in &e.layers {
         out.push('\n');
-        layer(out, l);
+        comments.flush_before(out, l.span.start, 1);
+        layer(out, l, comments);
     }
 
+    // Anything still inside the braces belongs to this effect, not to whatever
+    // declaration follows it.
+    comments.flush_before(out, e.span.end, 1);
     out.push_str("}\n");
 }
 
@@ -153,7 +226,7 @@ fn section<T>(out: &mut String, items: &[T], mut each: impl FnMut(&mut String, &
     }
 }
 
-fn layer(out: &mut String, l: &Layer) {
+fn layer(out: &mut String, l: &Layer, comments: &mut Comments<'_>) {
     indent(out, 1);
     out.push_str(&format!("layer {}", l.name));
     if let Some(m) = &l.mask {
@@ -167,16 +240,19 @@ fn layer(out: &mut String, l: &Layer) {
     }
     out.push_str(" {\n");
     for b in &l.lets {
+        comments.flush_before(out, b.span.start, 2);
         indent(out, 2);
         out.push_str(&format!("let {} = {}\n", b.name, expr(&b.value)));
     }
     for a in &l.assigns {
+        comments.flush_before(out, a.span.start, 2);
         indent(out, 2);
         match &a.field {
             Some(f) => out.push_str(&format!("{}.{} = {}\n", a.target, f, expr(&a.value))),
             None => out.push_str(&format!("{} = {}\n", a.target, expr(&a.value))),
         }
     }
+    comments.flush_before(out, l.span.end, 2);
     indent(out, 1);
     out.push_str("}\n");
 }

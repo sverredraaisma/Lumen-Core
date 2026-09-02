@@ -38,7 +38,23 @@ struct Version {
 /// Adding a version means adding an entry; never changing one.
 static VERSIONS: &[Version] = &[Version {
     number: 1,
-    files: &[("core.lfx", include_str!("../../../stdlib/v1/core.lfx"))],
+    files: &[
+        ("colour.lfx", include_str!("../../../stdlib/v1/colour.lfx")),
+        ("easing.lfx", include_str!("../../../stdlib/v1/easing.lfx")),
+        ("noise.lfx", include_str!("../../../stdlib/v1/noise.lfx")),
+        (
+            "palettes.lfx",
+            include_str!("../../../stdlib/v1/palettes.lfx"),
+        ),
+        ("random.lfx", include_str!("../../../stdlib/v1/random.lfx")),
+        ("shapes.lfx", include_str!("../../../stdlib/v1/shapes.lfx")),
+        ("space.lfx", include_str!("../../../stdlib/v1/space.lfx")),
+        (
+            "utility.lfx",
+            include_str!("../../../stdlib/v1/utility.lfx"),
+        ),
+        ("waves.lfx", include_str!("../../../stdlib/v1/waves.lfx")),
+    ],
 }];
 
 /// The versions this compiler can compile against, lowest first.

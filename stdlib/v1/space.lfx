@@ -1,0 +1,60 @@
+lumen 1
+
+# Space — stdlib v1
+#
+# Coordinate transforms. Each one takes a point and returns a point, or a
+# component of one, so they compose: `twist` a position, then `polar` it, then
+# feed the angle to a wave.
+#
+# Angles here are **turns**, consistent with Waves, so an angle coming out of
+# `polar` can be fed straight into `sine01` without a conversion. Feeding it to
+# the core `sin` instead would be wrong by a factor of tau, which is exactly the
+# bug the unit-carrying literals exist to prevent.
+
+# Reflect a coordinate so it repeats back and forth instead of jumping. Useful
+# on `u`: a gradient mirrored about the middle of a strip has no seam.
+fn mirror(v: float) -> float {
+  return abs(fract(v * 0.5) * 2 - 1)
+}
+
+# Repeat space every `size` metres, returning the offset within the cell.
+# Everything downstream then only has to describe one cell.
+fn tile(v: float, size: float) -> float {
+  return fract(v / size) * size
+}
+
+# Cartesian to polar about the origin of the XY plane.
+# Returns `vec2(radius, angle)` with the angle in turns, 0..1 — so `.y` is
+# directly a phase, and a rotating sweep is `sine01(polar(x, y).y + t)`.
+fn polar(px: float, py: float) -> vec2 {
+  let a = atan2(py, px) * 0.15915494 + 0.5
+  return vec2(length(px, py), a)
+}
+
+# Cartesian to spherical, `vec3(radius, azimuth, inclination)`, both angles in
+# turns. Inclination is 0 at the south pole and 1 at the north, so it can be
+# used as a palette position with no remap.
+fn spherical(px: float, py: float, pz: float) -> vec3 {
+  return vec3(length(px, py, pz),
+              atan2(pz, px) * 0.15915494 + 0.5,
+              atan2(py, length(px, pz)) * 0.31830988 + 0.5)
+}
+
+# Rotate about the Y axis by an angle proportional to height: a helix generator.
+# `amount` is turns per metre, so `twist(x, y, z, 0.25)` is a quarter turn per
+# metre of ceiling height.
+fn twist(px: float, py: float, pz: float, amount: float) -> vec3 {
+  return vec3(px * cos01(py * amount) - pz * sin01(py * amount),
+              py,
+              px * sin01(py * amount) + pz * cos01(py * amount))
+}
+
+# Bend space around the Z axis, curving a straight run into an arc. `amount` is
+# turns per metre of X. The transform is not area-preserving, so a noise field
+# sampled through it stretches — usually the desired look, occasionally a
+# surprise.
+fn bend(px: float, py: float, pz: float, amount: float) -> vec3 {
+  return vec3(px * cos01(px * amount) - py * sin01(px * amount),
+              px * sin01(px * amount) + py * cos01(px * amount),
+              pz)
+}

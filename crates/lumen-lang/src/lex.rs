@@ -158,11 +158,38 @@ pub struct Token {
     pub span: Span,
 }
 
+/// A comment, kept rather than thrown away.
+///
+/// The formatter has to put these back. Text is the canonical format and the
+/// node editor is a view over it, so a round trip that silently deleted every
+/// comment would take an author's explanation of *why* an effect works and
+/// discard it - which is the one thing a diffable text format was supposed to
+/// protect.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Comment {
+    /// The text after `#`, trimmed of a single leading space.
+    pub text: String,
+    pub span: Span,
+    /// True when the comment sits on a line of its own.
+    ///
+    /// A trailing comment belongs to the line it follows; a standalone one
+    /// belongs to whatever comes next. Getting this wrong moves a comment away
+    /// from the thing it explains, which is worse than losing it - a wrong
+    /// explanation reads as true.
+    pub own_line: bool,
+}
+
 /// Turn source text into tokens.
 ///
 /// Returns as many tokens as it can even when something is wrong, so the parser
 /// can report several problems in one run rather than one per compile.
 pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
+    let (tokens, _, diags) = lex_with_comments(src);
+    (tokens, diags)
+}
+
+/// Lex, keeping the comments.
+pub fn lex_with_comments(src: &str) -> (Vec<Token>, Vec<Comment>, Vec<Diagnostic>) {
     Lexer::new(src).run()
 }
 
@@ -172,6 +199,7 @@ struct Lexer<'a> {
     pos: usize,
     depth: u32,
     out: Vec<Token>,
+    comments: Vec<Comment>,
     errs: Vec<Diagnostic>,
 }
 
@@ -183,6 +211,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             depth: 0,
             out: Vec::new(),
+            comments: Vec::new(),
             errs: Vec::new(),
         }
     }
@@ -208,7 +237,7 @@ impl<'a> Lexer<'a> {
         });
     }
 
-    fn run(mut self) -> (Vec<Token>, Vec<Diagnostic>) {
+    fn run(mut self) -> (Vec<Token>, Vec<Comment>, Vec<Diagnostic>) {
         while self.pos < self.src.len() {
             let start = self.pos;
             let c = self.peek();
@@ -246,7 +275,7 @@ impl<'a> Lexer<'a> {
             tok: Tok::Eof,
             span: Span::new(end, end),
         });
-        (self.out, self.errs)
+        (self.out, self.comments, self.errs)
     }
 
     /// `#` starts either a comment or a hex colour. Distinguished by what
@@ -267,9 +296,22 @@ impl<'a> Lexer<'a> {
             }
             self.push(Tok::HexColor(rgba), start);
         } else {
+            // Whether anything but whitespace precedes it on this line decides
+            // where the comment belongs when the file is reformatted.
+            let line_start = self.text[..start].rfind('\n').map_or(0, |i| i + 1);
+            let own_line = self.text[line_start..start].trim().is_empty();
+            self.pos += 1; // the `#`
+            let from = self.pos;
             while self.pos < self.src.len() && self.peek() != b'\n' {
                 self.pos += 1;
             }
+            let text = self.text[from..self.pos].trim_end();
+            let text = text.strip_prefix(' ').unwrap_or(text);
+            self.comments.push(Comment {
+                text: text.into(),
+                span: Span::new(start, self.pos),
+                own_line,
+            });
         }
     }
 

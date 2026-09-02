@@ -1,0 +1,46 @@
+lumen 1
+
+# Waves — stdlib v1
+#
+# Phase is measured in **turns**, not radians: one whole number is one cycle.
+# That is what the `sin01`/`cos01` instructions take, it makes `fract` the
+# natural way to wrap a phase, and it removes the radians-versus-degrees mistake
+# from the most common expression in the whole language, `wave(t * speed)`.
+#
+# Every function here returns 0..1, so a wave can be multiplied straight into a
+# brightness without a remap. The core `sin01` returns -1..1 — the `01` in its
+# name is about its *input* domain, in turns. `sine01` below is the one that is
+# 0..1 on both sides, which is almost always what an effect wants.
+
+fn sine01(phase: float) -> float {
+  return sin01(phase) * 0.5 + 0.5
+}
+
+# Rises 0 to 1 over the first half of the cycle and falls back over the second.
+# Cheaper than a sine and, at LED resolution, usually indistinguishable.
+fn triangle(phase: float) -> float {
+  let f = fract(phase)
+  return 1 - abs(f * 2 - 1)
+}
+
+fn sawtooth(phase: float) -> float {
+  return fract(phase)
+}
+
+# 0 for the first half of the cycle, 1 for the second.
+fn square(phase: float) -> float {
+  return step(0.5, fract(phase))
+}
+
+# A square wave with a duty cycle: 1 while the phase is below `duty`.
+# `duty` 0.5 reproduces `square` inverted; `duty` 0.05 is a strobe.
+fn pulse(phase: float, duty: float) -> float {
+  return 1 - step(duty, fract(phase))
+}
+
+# Travels 0 to `len` and back over one turn. The obvious use is a position that
+# has to stay inside a strip without the jump a sawtooth would give.
+fn ping_pong(phase: float, len: float) -> float {
+  let f = fract(phase) * 2
+  return (1 - abs(f - 1)) * len
+}

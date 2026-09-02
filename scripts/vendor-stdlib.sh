@@ -25,21 +25,30 @@ root="$(cd "$here/.." && pwd)"
 effects="${LUMEN_EFFECTS:-$root/../lumen-effects}"
 
 force=0
+worktree=0
 args=()
 for a in "$@"; do
   case "$a" in
     --force) force=1 ;;
+    # Before the first lumen-effects release there is no tag to vendor from.
+    # This copies the working tree instead and records that plainly in the
+    # manifest, rather than naming a tag that does not exist.
+    --from-worktree) worktree=1 ;;
     *) args+=("$a") ;;
   esac
 done
 
-if [ "${#args[@]}" -lt 1 ]; then
+if [ "$worktree" -eq 1 ]; then
+  tag="UNRELEASED-worktree"
+  version="${args[0]:-v1}"
+elif [ "${#args[@]}" -lt 1 ]; then
   echo "usage: $0 <lumen-effects-tag> [version] [--force]" >&2
+  echo "       $0 --from-worktree [version] [--force]" >&2
   exit 2
+else
+  tag="${args[0]}"
+  version="${args[1]:-v1}"
 fi
-
-tag="${args[0]}"
-version="${args[1]:-v1}"
 dest="$root/stdlib/$version"
 
 if [ ! -d "$effects/.git" ]; then
@@ -59,11 +68,15 @@ if [ -f "$dest/manifest.toml" ] && [ "$force" -eq 0 ]; then
   exit 1
 fi
 
-echo "vendoring $version from lumen-effects tag $tag"
-src_ref="$tag:stdlib/$version"
-files=$(git -C "$effects" ls-tree --name-only "$src_ref" 2>/dev/null || true)
+echo "vendoring $version from lumen-effects ($tag)"
+if [ "$worktree" -eq 1 ]; then
+  files=$(cd "$effects/stdlib/$version" 2>/dev/null && ls *.lfx 2>/dev/null || true)
+else
+  src_ref="$tag:stdlib/$version"
+  files=$(git -C "$effects" ls-tree --name-only "$src_ref" 2>/dev/null || true)
+fi
 if [ -z "$files" ]; then
-  echo "tag $tag has no stdlib/$version" >&2
+  echo "no stdlib/$version to vendor from $tag" >&2
   exit 1
 fi
 
@@ -86,7 +99,11 @@ for f in $files; do
     *.lfx) ;;
     *) continue ;;
   esac
-  git -C "$effects" show "$src_ref/$f" > "$dest/$f"
+  if [ "$worktree" -eq 1 ]; then
+    cp "$effects/stdlib/$version/$f" "$dest/$f"
+  else
+    git -C "$effects" show "$src_ref/$f" > "$dest/$f"
+  fi
   sum=$(sha256sum "$dest/$f" | cut -d' ' -f1)
   {
     echo "[[file]]"

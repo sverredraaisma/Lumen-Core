@@ -376,7 +376,7 @@ fn a_palette_is_baked_and_sampled() {
     let src = r#"
 lumen 1
 
-palette fire {
+palette embers {
   space linear_rgb
   0 #000000
   1 #ff0000
@@ -384,7 +384,7 @@ palette fire {
 
 effect "p" {
   layer base {
-    color = palette(fire, u)
+    color = palette(embers, u)
   }
 }
 "#;
@@ -708,7 +708,7 @@ fn a_realistic_two_layer_effect_fits_in_the_register_file() {
     let src = r#"
 lumen 1
 
-palette sunset {
+palette dusk {
   space linear_rgb
   0 #200018
   0.5 #ff6020
@@ -720,7 +720,7 @@ effect "sunset sweep" {
   let phase = t * speed
   mask upper = z > 0.3
   layer base {
-    color = palette(sunset, u + phase)
+    color = palette(dusk, u + phase)
   }
   layer glow mask(upper) blend add opacity 0.35 {
     let n = noise3(x, y, z - phase)
@@ -1414,4 +1414,177 @@ fn normalize_and_cross_refuse_a_scalar() {
     assert!(errors(&alloc_src("cross(1, 2).x"))
         .iter()
         .any(|e| e.contains("vec3")));
+}
+
+#[test]
+fn a_file_scope_function_is_callable() {
+    // The grammar lists `fn` as a top-level declaration. It used to parse and
+    // then be silently ignored, so the declaration was accepted and the call
+    // site reported "unknown function" - a declaration that parses and does
+    // nothing is exactly what the "unknown construct is an error" rule exists
+    // to prevent.
+    let src = r#"
+lumen 1
+
+fn halve(v : float) -> float {
+  return v * 0.5
+}
+
+effect "top level" {
+  layer base {
+    color = rgb(halve(1), 0, 0)
+  }
+}
+"#;
+    match render(src, PixelInputs::default(), Q16::ZERO) {
+        PixelOutput::Rgb { r, .. } => assert_eq!(r, Q16::HALF),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_file_scope_function_clashing_with_one_inside_the_effect_is_reported() {
+    let src = r#"
+lumen 1
+
+fn twice(v : float) -> float { return v * 2 }
+
+effect "clash" {
+  fn twice(v : float) -> float { return v * 3 }
+  layer base { color = rgb(twice(1), 0, 0) }
+}
+"#;
+    let es = errors(src);
+    assert!(es.iter().any(|e| e.contains("already declared")), "{es:?}");
+}
+
+#[test]
+fn the_vendored_stdlib_provides_its_named_palettes() {
+    // The grammar names eight. Referencing one has to work without declaring
+    // anything, or every trivial example starts with a gradient.
+    for name in [
+        "warm", "cool", "ocean", "fire", "ice", "rainbow", "mono", "sunset",
+    ] {
+        let src = format!(
+            "lumen 1\neffect \"p\" {{\n  layer l {{\n    color = palette({name}, u)\n  }}\n}}\n"
+        );
+        let (out, diags) = compile(&src);
+        assert!(out.is_some(), "palette `{name}`:\n{}", diags.render(&src));
+    }
+}
+
+#[test]
+fn remap_honours_its_output_range() {
+    // The interim stdlib took four arguments and silently ignored the output
+    // range, so `remap(v, 0, 1, 10, 20)` did not reach 20. Found by the example
+    // corpus, which is the argument for the corpus existing.
+    let src = r#"
+lumen 1
+effect "remap" {
+  layer base {
+    let v = remap(u, 0, 1, 0, 0.5)
+    color = rgb(v, 0, 0)
+  }
+}
+"#;
+    let at = |u: i32| match render(
+        src,
+        PixelInputs {
+            u: Q16::from_ratio(u, 4),
+            ..Default::default()
+        },
+        Q16::ZERO,
+    ) {
+        PixelOutput::Rgb { r, .. } => r,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(at(0), Q16::ZERO);
+    let full = at(4);
+    let d = (full.0 - Q16::HALF.0).abs();
+    assert!(d < 600, "remap(1, 0, 1, 0, 0.5) gave {full:?}, wanted 0.5");
+}
+
+// ---- Comments survive a round trip -----------------------------------------
+
+#[test]
+fn the_formatter_keeps_comments() {
+    // Text is canonical and the editor is a view over it. A round trip that
+    // silently deleted every comment would take an author's explanation of why
+    // an effect works and throw it away - which is the one thing a diffable
+    // text format was supposed to protect.
+    let src = r#"
+lumen 1
+
+# What this effect is for.
+effect "commented" {
+  # Why this parameter exists.
+  param level : float = 0.5 range 0..1
+
+  # The hoisted part.
+  let wave = sin01(t)
+
+  layer base {
+    # Why the colour is built this way.
+    color = rgb(level, wave, 0)
+  }
+}
+
+# A closing note.
+"#;
+    let (out, diags) = format_source(src);
+    assert!(!diags.has_errors(), "{}", diags.render(src));
+    let out = out.unwrap();
+    for needle in [
+        "# What this effect is for.",
+        "# Why this parameter exists.",
+        "# The hoisted part.",
+        "# Why the colour is built this way.",
+        "# A closing note.",
+    ] {
+        assert!(out.contains(needle), "lost {needle}:\n{out}");
+    }
+}
+
+#[test]
+fn comments_stay_with_what_they_explain() {
+    // A comment moved away from its subject is worse than a lost one: a wrong
+    // explanation reads as true.
+    let src = "lumen 1\neffect \"x\" {\n  # about a\n  let a = 1\n  # about b\n  let b = 2\n  layer l { color = rgb(a, b, 0) }\n}\n";
+    let (out, _) = format_source(src);
+    let out = out.unwrap();
+    let about_a = out.find("# about a").expect("lost the first comment");
+    let let_a = out.find("let a").expect("lost a");
+    let about_b = out.find("# about b").expect("lost the second comment");
+    let let_b = out.find("let b").expect("lost b");
+    assert!(about_a < let_a, "the comment should precede its binding");
+    assert!(let_a < about_b, "the second comment drifted up");
+    assert!(about_b < let_b);
+}
+
+#[test]
+fn formatting_stays_idempotent_with_comments() {
+    let src = "lumen 1\n\n# top\neffect \"x\" {\n  # inner\n  let a = 1\n  layer l {\n    # deep\n    color = rgb(a, 0, 0)\n  }\n}\n# trailing\n";
+    let (once, _) = format_source(src);
+    let once = once.unwrap();
+    let (twice, _) = format_source(&once);
+    assert_eq!(once, twice.unwrap(), "reformatting moved a comment");
+}
+
+#[test]
+fn a_commented_file_still_compiles_to_the_same_bytecode_after_formatting() {
+    let src =
+        "lumen 1\n# a note\neffect \"x\" {\n  # another\n  layer l { color = rgb(1, 0, 0) }\n}\n";
+    let (formatted, _) = format_source(src);
+    let formatted = formatted.unwrap();
+    let (a, _) = build(src);
+    let (b, _) = build(&formatted);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn a_bare_hash_is_a_comment_and_not_a_colour() {
+    let src = "lumen 1\n#\neffect \"x\" {\n  layer l { color = rgb(1, 0, 0) }\n}\n";
+    let (out, diags) = format_source(src);
+    assert!(!diags.has_errors(), "{}", diags.render(src));
+    assert!(out.unwrap().contains('#'));
 }
