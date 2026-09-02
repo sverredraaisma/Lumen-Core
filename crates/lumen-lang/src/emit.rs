@@ -71,6 +71,7 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
         temp_floor: R_SCRATCH,
         next_temp: R_SCRATCH,
         high_water: R_SCRATCH,
+        inline_depth: 0,
         failed: false,
     };
     e.run();
@@ -141,8 +142,15 @@ struct Emitter<'a, 'd> {
     temp_floor: u8,
     next_temp: u8,
     high_water: u8,
+    inline_depth: u8,
     failed: bool,
 }
+
+/// How deep function inlining may nest.
+///
+/// Functions cannot recurse, so this only ever fires on a cycle or on genuinely
+/// deep nesting; either way a diagnostic beats a stack overflow in the compiler.
+const MAX_INLINE_DEPTH: u8 = 16;
 
 impl Emitter<'_, '_> {
     fn run(&mut self) {
@@ -633,6 +641,80 @@ impl Emitter<'_, '_> {
         }
     }
 
+    /// Inline a user function.
+    ///
+    /// Functions are the text form of an encapsulated node group, and they are
+    /// **always inlined**: no recursion, no function pointers, no dynamic
+    /// dispatch. Inlining is what keeps the instruction count static, which is
+    /// what keeps the budget check exact - a call would make cost depend on a
+    /// path taken at runtime, and the whole publish-time budget answer rests on
+    /// that not being true.
+    fn inline_fn(&mut self, rate: Rate, index: usize, args: &[Expr], e: &Expr) -> Option<Val> {
+        // A function that calls itself, directly or through another, would
+        // inline forever. The depth cap turns that into a diagnostic instead of
+        // a stack overflow in the compiler.
+        if self.inline_depth >= MAX_INLINE_DEPTH {
+            self.diags.push(Diagnostic::error(
+                e.span,
+                "functions nest too deeply, or call each other in a cycle",
+                "functions are always inlined, so they cannot recurse - rewrite the expression without the cycle",
+            ));
+            self.failed = true;
+            return None;
+        }
+
+        let decl = &self.r.effect.fns[index];
+        if decl.params.len() != args.len() {
+            self.diags.push(Diagnostic::error(
+                e.span,
+                alloc::format!(
+                    "`{}` takes {} arguments, but {} were given",
+                    decl.name,
+                    decl.params.len(),
+                    args.len()
+                ),
+                "check the argument list against the function declaration",
+            ));
+            return None;
+        }
+
+        // Evaluate the arguments in the caller's scope, then bind them to the
+        // parameter names for the body. Evaluating first is what makes an
+        // argument expression cost once however many times the parameter is
+        // mentioned in the body.
+        let mut bindings = Vec::new();
+        for (arg, (name, _)) in args.iter().zip(&decl.params) {
+            let v = self.expr(rate, arg)?;
+            bindings.push((name.clone(), v));
+        }
+
+        let saved = self.bound.len();
+        for b in bindings {
+            self.bound.push(b);
+        }
+        self.inline_depth += 1;
+
+        // The function's own `let`s, then its return expression.
+        let decl = &self.r.effect.fns[index];
+        let lets = decl.lets.clone();
+        let body = decl.body.clone();
+        let mut ok = true;
+        for l in &lets {
+            match self.expr(rate, &l.value) {
+                Some(v) => self.bound.push((l.name.clone(), v)),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        let out = if ok { self.expr(rate, &body) } else { None };
+
+        self.inline_depth -= 1;
+        self.bound.truncate(saved);
+        out
+    }
+
     fn call(&mut self, rate: Rate, callee: &str, args: &[Expr], e: &Expr) -> Option<Val> {
         // `palette` takes a palette name, not a value, so it cannot go through
         // the ordinary argument path.
@@ -653,6 +735,13 @@ impl Emitter<'_, '_> {
                 Instruction::new(OpCode::Palette, dst.base, pos.base, idx as u8),
             );
             return Some(dst);
+        }
+
+        // A user function is inlined with its arguments bound by name, so it
+        // cannot go through the ordinary "evaluate args into registers" path.
+        if core_fn(callee).is_none() {
+            let index = self.r.effect.fns.iter().position(|f| f.name == callee)?;
+            return self.inline_fn(rate, index, args, e);
         }
 
         let mark = self.next_temp;
@@ -781,19 +870,11 @@ impl Emitter<'_, '_> {
                 Instruction::new(op, dst.base, vals[1].base, vals[2].base)
             }
             other => {
-                if core_fn(other).is_some() {
-                    self.diags.push(Diagnostic::error(
-                        e.span,
-                        alloc::format!("`{other}` is not implemented yet"),
-                        "it is in the language but not yet in the emitter",
-                    ));
-                } else {
-                    self.diags.push(Diagnostic::error(
-                        e.span,
-                        alloc::format!("user functions are not inlined yet: `{other}`"),
-                        "write the expression inline for now",
-                    ));
-                }
+                self.diags.push(Diagnostic::error(
+                    e.span,
+                    alloc::format!("`{other}` is not implemented yet"),
+                    "it is in the language but not yet in the emitter",
+                ));
                 return None;
             }
         };

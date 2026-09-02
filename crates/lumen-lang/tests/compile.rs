@@ -755,3 +755,201 @@ effect "chain" {
         report.registers_used
     );
 }
+
+// ---- Function inlining -----------------------------------------------------
+
+#[test]
+fn a_user_function_is_inlined_and_computes_the_right_answer() {
+    // Functions are the text form of an encapsulated node group. They must
+    // behave exactly as if written out by hand.
+    let src = r#"
+lumen 1
+effect "fns" {
+  fn double(v : float) -> float {
+    return v * 2
+  }
+  layer base {
+    color = rgb(double(0.25), 0, 0)
+  }
+}
+"#;
+    match render(src, PixelInputs::default(), Q16::ZERO) {
+        PixelOutput::Rgb { r, .. } => assert_eq!(r, Q16::HALF),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_function_may_have_its_own_lets_and_several_parameters() {
+    let src = r#"
+lumen 1
+effect "fns" {
+  fn blend2(a : float, b : float) -> float {
+    let sum = a + b
+    let half = sum * 0.5
+    return half
+  }
+  layer base {
+    color = rgb(blend2(0.25, 0.75), 0, 0)
+  }
+}
+"#;
+    match render(src, PixelInputs::default(), Q16::ZERO) {
+        PixelOutput::Rgb { r, .. } => assert_eq!(r, Q16::HALF),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn functions_nest() {
+    let src = r#"
+lumen 1
+effect "fns" {
+  fn inner(v : float) -> float {
+    return v * 2
+  }
+  fn outer(v : float) -> float {
+    return inner(v) + inner(v)
+  }
+  layer base {
+    color = rgb(outer(0.125), 0, 0)
+  }
+}
+"#;
+    match render(src, PixelInputs::default(), Q16::ZERO) {
+        PixelOutput::Rgb { r, .. } => assert_eq!(r, Q16::HALF),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_function_sees_pixel_inputs_through_its_arguments() {
+    let src = r#"
+lumen 1
+effect "fns" {
+  fn ramp(v : float) -> float {
+    return v * v
+  }
+  layer base {
+    color = rgb(ramp(u), 0, 0)
+  }
+}
+"#;
+    let out = render(
+        src,
+        PixelInputs {
+            u: Q16::HALF,
+            ..Default::default()
+        },
+        Q16::ZERO,
+    );
+    match out {
+        PixelOutput::Rgb { r, .. } => assert_eq!(r, Q16::from_ratio(1, 4)),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn inlining_a_function_costs_the_same_as_writing_it_out() {
+    // If it did not, the budget report would be lying about what the effect
+    // costs, and the whole publish-time budget answer rests on it.
+    let inlined = build(
+        r#"
+lumen 1
+effect "a" {
+  fn f(v : float) -> float { return v * 2 + 1 }
+  layer base { color = rgb(f(u), 0, 0) }
+}
+"#,
+    )
+    .1;
+    let by_hand = build(
+        r#"
+lumen 1
+effect "b" {
+  layer base { color = rgb(u * 2 + 1, 0, 0) }
+}
+"#,
+    )
+    .1;
+    assert_eq!(
+        inlined.instructions_per_pixel,
+        by_hand.instructions_per_pixel
+    );
+}
+
+#[test]
+fn a_recursive_function_is_refused_by_name() {
+    // Functions are always inlined, so recursion cannot work at all. Saying so
+    // beats a stack overflow in the compiler.
+    let direct = errors(
+        r#"
+lumen 1
+effect "x" {
+  fn loopy(v : float) -> float { return loopy(v) }
+  layer base { color = rgb(loopy(1), 0, 0) }
+}
+"#,
+    );
+    assert!(direct.iter().any(|e| e.contains("recursive")), "{direct:?}");
+
+    let indirect = errors(
+        r#"
+lumen 1
+effect "x" {
+  fn a(v : float) -> float { return b(v) }
+  fn b(v : float) -> float { return a(v) }
+  layer base { color = rgb(a(1), 0, 0) }
+}
+"#,
+    );
+    assert!(
+        indirect.iter().any(|e| e.contains("recursive")),
+        "{indirect:?}"
+    );
+}
+
+#[test]
+fn calling_a_function_with_the_wrong_number_of_arguments_is_refused() {
+    let es = errors(
+        r#"
+lumen 1
+effect "x" {
+  fn f(a : float, b : float) -> float { return a + b }
+  layer base { color = rgb(f(1), 0, 0) }
+}
+"#,
+    );
+    assert!(es.iter().any(|e| e.contains("arguments")), "{es:?}");
+}
+
+#[test]
+fn an_argument_expression_is_evaluated_once_however_often_it_is_used() {
+    // The parameter is mentioned three times in the body; the caller's argument
+    // must still be computed once.
+    let once = build(
+        r#"
+lumen 1
+effect "a" {
+  fn thrice(v : float) -> float { return v + v + v }
+  layer base { color = rgb(thrice(noise1(u)), 0, 0) }
+}
+"#,
+    )
+    .1;
+    let thrice = build(
+        r#"
+lumen 1
+effect "b" {
+  layer base { color = rgb(noise1(u) + noise1(u) + noise1(u), 0, 0) }
+}
+"#,
+    )
+    .1;
+    assert!(
+        once.instructions_per_pixel < thrice.instructions_per_pixel,
+        "argument was evaluated more than once: {} vs {}",
+        once.instructions_per_pixel,
+        thrice.instructions_per_pixel
+    );
+}

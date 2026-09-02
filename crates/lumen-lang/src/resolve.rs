@@ -409,6 +409,7 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
         symbols: BTreeMap::new(),
         has_grid: effect.requires.contains(&Cap::Grid),
         read: alloc::collections::BTreeSet::new(),
+        fns: effect.fns.clone(),
     };
 
     for (index, p) in palettes.iter().enumerate() {
@@ -454,6 +455,20 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
                 index,
             },
         );
+    }
+
+    // A function that calls itself, directly or through another, cannot be
+    // inlined - and inlining is the only thing the compiler does with them.
+    // Catching it here names a function on the cycle; catching it in the
+    // emitter would only report that nesting got too deep.
+    for f in &effect.fns {
+        if let Some(via) = calls_itself(f, &effect.fns) {
+            r.diags.push(Diagnostic::error(
+                f.span,
+                alloc::format!("function `{}` is recursive (through `{via}`)", f.name),
+                "functions are always inlined, so they cannot recurse - rewrite it without the cycle",
+            ));
+        }
     }
 
     // Parameters are constants at compile time: they change between activations,
@@ -675,6 +690,8 @@ struct Resolver<'d> {
     has_grid: bool,
     /// Channels actually read, so an unread one can be reported.
     read: alloc::collections::BTreeSet<String>,
+    /// The effect's functions, for arity checking at the call site.
+    fns: Vec<FnDecl>,
 }
 
 impl Resolver<'_> {
@@ -767,17 +784,36 @@ impl Resolver<'_> {
                     }
                     return (sig.ret, rate);
                 }
-                match self.symbols.get(callee) {
-                    Some(s) if s.kind == SymbolKind::Fn => (s.ty, rate),
+                let (ty, rate, index) = match self.symbols.get(callee) {
+                    Some(s) if s.kind == SymbolKind::Fn => {
+                        let (ty, index) = (s.ty, s.index);
+                        (ty, rate, index)
+                    }
                     _ => {
                         self.diags.push(Diagnostic::error(
                             e.span,
                             alloc::format!("unknown function `{callee}`"),
                             "check the spelling, or declare it with `fn`",
                         ));
-                        (Type::Float, rate)
+                        (Type::Float, rate, usize::MAX)
+                    }
+                };
+                if index != usize::MAX {
+                    if let Some(f) = self.fns.get(index) {
+                        if f.params.len() != args.len() {
+                            self.diags.push(Diagnostic::error(
+                                e.span,
+                                alloc::format!(
+                                    "`{callee}` takes {} arguments, but {} were given",
+                                    f.params.len(),
+                                    args.len()
+                                ),
+                                "check the argument list against the function declaration",
+                            ));
+                        }
                     }
                 }
+                (ty, rate)
             }
             ExprKind::MethodCall { base, args, .. } => {
                 let (_, mut rate) = self.check(base);
@@ -876,4 +912,61 @@ fn describe_arity(arity: &[usize]) -> String {
         s.push_str(&alloc::format!("{a}"));
     }
     s
+}
+
+/// Whether `f` can reach itself through the call graph, and via which name.
+///
+/// A depth-limited walk rather than a proper strongly-connected-components
+/// pass: the call graph of one effect is tiny, and naming *a* function on the
+/// cycle is enough for the author to find it.
+fn calls_itself(f: &FnDecl, all: &[FnDecl]) -> Option<String> {
+    fn reaches(
+        target: &str,
+        expr: &Expr,
+        all: &[FnDecl],
+        seen: &mut Vec<String>,
+    ) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Call { callee, args } => {
+                if callee == target {
+                    return Some(callee.clone());
+                }
+                for a in args {
+                    if let Some(v) = reaches(target, a, all, seen) {
+                        return Some(v);
+                    }
+                }
+                if seen.iter().any(|s| s == callee) {
+                    return None;
+                }
+                let next = all.iter().find(|g| &g.name == callee)?;
+                seen.push(callee.clone());
+                for l in &next.lets {
+                    if reaches(target, &l.value, all, seen).is_some() {
+                        return Some(callee.clone());
+                    }
+                }
+                if reaches(target, &next.body, all, seen).is_some() {
+                    return Some(callee.clone());
+                }
+                None
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                reaches(target, lhs, all, seen).or_else(|| reaches(target, rhs, all, seen))
+            }
+            ExprKind::Unary { operand, .. } => reaches(target, operand, all, seen),
+            ExprKind::Field { base, .. } => reaches(target, base, all, seen),
+            ExprKind::MethodCall { base, args, .. } => reaches(target, base, all, seen)
+                .or_else(|| args.iter().find_map(|a| reaches(target, a, all, seen))),
+            _ => None,
+        }
+    }
+
+    let mut seen = alloc::vec![f.name.clone()];
+    for l in &f.lets {
+        if let Some(v) = reaches(&f.name, &l.value, all, &mut seen) {
+            return Some(v);
+        }
+    }
+    reaches(&f.name, &f.body, all, &mut seen)
 }
