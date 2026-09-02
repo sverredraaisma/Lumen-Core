@@ -690,3 +690,68 @@ effect "costly" {
         costly.instructions_per_pixel
     );
 }
+
+#[test]
+fn a_realistic_two_layer_effect_fits_in_the_register_file() {
+    // Found by running the CLI on the first effect that was not a toy: without
+    // releasing scratch between subexpressions and between layers, this ran the
+    // 32-register file dry and was rejected outright. Anything a user would
+    // plausibly write on day one has to compile.
+    let src = r#"
+lumen 1
+
+palette sunset {
+  space linear_rgb
+  0 #200018
+  0.5 #ff6020
+  1 #ffe0a0
+}
+
+effect "sunset sweep" {
+  param speed : float = 0.2 range 0..2
+  let phase = t * speed
+  mask upper = z > 0.3
+  layer base {
+    color = palette(sunset, u + phase)
+  }
+  layer glow mask(upper) blend add opacity 0.35 {
+    let n = noise3(x, y, z - phase)
+    color = rgb(n, n * 0.6, 0)
+  }
+}
+"#;
+    let (bytes, report) = build(src);
+    assert!(Program::parse(&bytes).is_ok());
+    assert!(
+        report.registers_used <= 32,
+        "used {} registers",
+        report.registers_used
+    );
+    // And it must be comfortably inside an ESP32-C3's ~900 per-pixel budget,
+    // or the budget table in the design notes is fiction.
+    assert!(
+        report.instructions_per_pixel < 400,
+        "costs {} per pixel",
+        report.instructions_per_pixel
+    );
+}
+
+#[test]
+fn scratch_registers_are_reused_across_a_long_expression_chain() {
+    // A chain of scalar operations must not consume a register per step.
+    let src = r#"
+lumen 1
+effect "chain" {
+  layer base {
+    let a = ((((u + 1) * 2 - 3) / 4 + 5) * 6 - 7) / 8 + 9
+    color = rgb(a, a, a)
+  }
+}
+"#;
+    let (_, report) = build(src);
+    assert!(
+        report.registers_used < 24,
+        "a scalar chain used {} registers",
+        report.registers_used
+    );
+}

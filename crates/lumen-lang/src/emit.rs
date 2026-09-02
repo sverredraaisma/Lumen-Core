@@ -214,6 +214,17 @@ impl Emitter<'_, '_> {
         Some(Val { base, width })
     }
 
+    /// Give scratch back, without ever dropping below the floor.
+    ///
+    /// `high_water` is deliberately not lowered: the budget report should say
+    /// how many registers the effect needed at its widest point, not how many
+    /// happen to be live at the end.
+    fn release_to(&mut self, mark: u8) {
+        if mark >= self.temp_floor {
+            self.next_temp = mark;
+        }
+    }
+
     fn out_of_registers(&mut self) {
         if !self.failed {
             self.failed = true;
@@ -296,8 +307,11 @@ impl Emitter<'_, '_> {
         let body_start = self.pixel.len();
 
         // Layer-local `let`s are pixel-rate by construction: they are inside the
-        // per-pixel section and cannot outlive it.
+        // per-pixel section and cannot outlive it. Their registers are released
+        // when the layer ends — without this the floor ratchets upward and a
+        // handful of layers exhausts the register file.
         let saved_bound = self.bound.len();
+        let saved_floor = self.temp_floor;
         for b in &layer.lets {
             self.next_temp = self.temp_floor;
             let Some(v) = self.expr(Rate::Pixel, &b.value) else {
@@ -354,6 +368,8 @@ impl Emitter<'_, '_> {
             self.pixel[idx] = Instruction::with_imm(OpCode::MaskTest, self.pixel[idx].a, skip);
         }
         self.bound.truncate(saved_bound);
+        self.temp_floor = saved_floor;
+        self.next_temp = saved_floor;
     }
 
     fn mask_value(&mut self, name: &str) -> Option<Val> {
@@ -361,11 +377,9 @@ impl Emitter<'_, '_> {
         let expr = self.r.effect.masks[idx].value.clone();
         self.next_temp = self.temp_floor;
         let v = self.expr(Rate::Pixel, &expr)?;
-        let dst = self.temp(1)?;
-        self.pixel
-            .push(Instruction::new(OpCode::Mov, dst.base, v.base, 0));
-        self.temp_floor = self.next_temp;
-        Some(dst)
+        // No need to reserve this past the MASKTEST that reads it next: the
+        // register is dead the moment the skip has been decided.
+        Some(v)
     }
 
     /// Composite `src` onto `dst` in place.
@@ -641,6 +655,7 @@ impl Emitter<'_, '_> {
             return Some(dst);
         }
 
+        let mark = self.next_temp;
         let mut vals = Vec::new();
         for a in args {
             vals.push(self.expr(rate, a)?);
@@ -723,7 +738,12 @@ impl Emitter<'_, '_> {
             _ => {}
         }
 
-        // The straightforward one-instruction cases.
+        // The straightforward one-instruction cases. Each reads its sources and
+        // writes its destination, so reusing the argument scratch is safe as
+        // long as every argument is a scalar.
+        if vals.iter().all(|v| v.width == 1) {
+            self.release_to(mark);
+        }
         let dst = self.temp(1)?;
         let ins = match callee {
             "abs" => Instruction::new(OpCode::Abs, dst.base, vals[0].base, 0),
@@ -782,10 +802,21 @@ impl Emitter<'_, '_> {
     }
 
     fn binary(&mut self, rate: Rate, op: BinOp, lhs: &Expr, rhs: &Expr) -> Option<Val> {
+        let mark = self.next_temp;
         let a = self.expr(rate, lhs)?;
         let b = self.expr(rate, rhs)?;
         let width = a.width.max(b.width);
-        let dst = self.temp(width)?;
+        // Once both operands are in registers, their scratch is dead and the
+        // result can reuse it. Only safe for the all-scalar case: with a
+        // broadcasting operand the destination would overwrite a value later
+        // components still need to read. Scalars are the overwhelming majority
+        // of an effect, and without this a handful of layers exhausts the file.
+        let dst = if width == 1 && a.width == 1 && b.width == 1 {
+            self.release_to(mark);
+            self.temp(1)?
+        } else {
+            self.temp(width)?
+        };
         for k in 0..width {
             let (x, y) = (a.at(k), b.at(k));
             let d = dst.base + k;
