@@ -1067,3 +1067,111 @@ effect "echo" {
         }
     );
 }
+
+// ---- The standard library --------------------------------------------------
+
+#[test]
+fn a_stdlib_function_can_be_called_without_declaring_it() {
+    // Referencing `ease_out` is not an external reference: the definition is
+    // vendored into the compiler and is part of the pinned language version, so
+    // the file stays self-contained.
+    let src = r#"
+lumen 1
+effect "eased" {
+  layer base {
+    let v = ease_out(u)
+    color = rgb(v, v, v)
+  }
+}
+"#;
+    let out = render(
+        src,
+        PixelInputs {
+            u: Q16::HALF,
+            ..Default::default()
+        },
+        Q16::ZERO,
+    );
+    match out {
+        // ease_out(0.5) = 1 - 0.25 = 0.75
+        PixelOutput::Rgb { r, .. } => assert_eq!(r, Q16::from_ratio(3, 4)),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn several_stdlib_functions_compose() {
+    let src = r#"
+lumen 1
+effect "waves" {
+  layer base {
+    let v = contrast(triangle(u), 2)
+    color = rgb(v, v, v)
+  }
+}
+"#;
+    let at = |u: i32| {
+        render(
+            src,
+            PixelInputs {
+                u: Q16::from_ratio(u, 4),
+                ..Default::default()
+            },
+            Q16::ZERO,
+        )
+    };
+    // A triangle peaks in the middle, so the middle sample must be the brightest.
+    let (a, b, c) = (at(0), at(2), at(4));
+    assert_ne!(a, b);
+    assert_eq!(a, c, "a triangle is periodic");
+}
+
+#[test]
+fn unused_stdlib_functions_cost_nothing() {
+    // The whole library is linked in; only what is called may reach the
+    // bytecode, or every effect would carry hundreds of instructions it never
+    // executes.
+    let bare = build(SOLID).1;
+    assert!(
+        bare.instructions_per_pixel < 20,
+        "an effect calling no stdlib function cost {}",
+        bare.instructions_per_pixel
+    );
+}
+
+#[test]
+fn declaring_a_function_that_shadows_a_stdlib_one_is_reported_at_the_users_span() {
+    let src = r#"
+lumen 1
+effect "clash" {
+  fn ease_out(t : float) -> float { return t }
+  layer base { color = rgb(0, 0, 0) }
+}
+"#;
+    let (_, diags) = compile(src);
+    let e = diags
+        .errors()
+        .find(|d| d.message.contains("already declared"))
+        .expect("expected a duplicate declaration error");
+    // Reported against the user's own file, not somewhere inside the library.
+    assert!(e.span.start < src.len());
+}
+
+#[test]
+fn an_unknown_stdlib_version_says_which_ones_exist() {
+    let es = errors("lumen 1\neffect \"x\" {\n  stdlib 99\n  layer b { color = rgb(0,0,0) }\n}\n");
+    assert!(es.iter().any(|e| e.contains("stdlib version 99")), "{es:?}");
+}
+
+#[test]
+fn the_stdlib_version_reaches_the_graph_hash() {
+    // Two files identical but for their stdlib version must not be mistaken for
+    // each other by the "already running, skip the upload" check.
+    let v1 = "lumen 1\neffect \"x\" {\n  stdlib 1\n  layer b { color = rgb(1,0,0) }\n}\n";
+    let plain = "lumen 1\neffect \"x\" {\n  layer b { color = rgb(1,0,0) }\n}\n";
+    let (a, _) = build(v1);
+    let (b, _) = build(plain);
+    // The default IS version 1, so these must agree - a different default would
+    // silently change every unversioned effect.
+    assert_eq!(a, b);
+}

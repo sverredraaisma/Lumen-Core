@@ -1,0 +1,116 @@
+# Lumen standard library, version 1.
+#
+# VENDORED — do not edit here.
+#
+# This is a copy, synchronised from a `lumen-effects` tag by
+# `scripts/vendor-stdlib.sh`. Editing it in place makes the checksum manifest
+# lie and the two copies drift. Change it in `lumen-effects` and re-vendor.
+#
+# Version 1 is frozen. Additions go into `stdlib/v2/`, never here: an effect
+# that declares `stdlib 1` must compile to the same bytecode in two years as it
+# does today, and that is only true if this file never changes.
+
+lumen 1
+
+# ---- Waves ------------------------------------------------------------------
+# All take and return a 0..1 phase, so they compose without scaling constants.
+
+fn sine01(phase : float) -> float {
+  return sin01(phase) * 0.5 + 0.5
+}
+
+fn triangle(phase : float) -> float {
+  let f = fract(phase)
+  return 1 - abs(f * 2 - 1)
+}
+
+fn sawtooth(phase : float) -> float {
+  return fract(phase)
+}
+
+fn square(phase : float) -> float {
+  return step(fract(phase), 0.5)
+}
+
+fn pulse(phase : float, width : float) -> float {
+  return 1 - step(fract(phase), width)
+}
+
+fn ping_pong(phase : float) -> float {
+  return triangle(phase)
+}
+
+# ---- Easing -----------------------------------------------------------------
+
+fn ease_in(t : float) -> float {
+  return t * t
+}
+
+fn ease_out(t : float) -> float {
+  let inv = 1 - t
+  return 1 - inv * inv
+}
+
+fn ease_in_out(t : float) -> float {
+  return smoothstep(t, 0, 1)
+}
+
+# ---- Utility ----------------------------------------------------------------
+
+fn remap(v : float, in_lo : float, in_hi : float, out_lo : float) -> float {
+  let span = in_hi - in_lo
+  let norm = (v - in_lo) / span
+  return out_lo + norm
+}
+
+fn remap_clamped(v : float, lo : float, hi : float) -> float {
+  let span = hi - lo
+  let norm = (v - lo) / span
+  return clamp(norm, 0, 1)
+}
+
+fn quantize(v : float, steps : float) -> float {
+  return floor(v * steps) / steps
+}
+
+fn deadzone(v : float, threshold : float) -> float {
+  return v * step(abs(v), threshold)
+}
+
+# ---- Shapes -----------------------------------------------------------------
+# Signed distance functions, negative inside.
+
+fn sphere_sdf(px : float, py : float, pz : float, radius : float) -> float {
+  return length(px, py, pz) - radius
+}
+
+fn plane_sdf(p : float, height : float) -> float {
+  return p - height
+}
+
+# ---- Random -----------------------------------------------------------------
+# Hash-based, never stateful, so a value is stable across frames and identical
+# on every device — which is the only way a random-looking effect can stay in
+# sync across a mesh.
+
+fn hash1(seed : float) -> float {
+  return noise1(seed * 127.1)
+}
+
+fn hash2(a : float, b : float) -> float {
+  return noise2(a * 127.1, b * 311.7)
+}
+
+fn rand_per_pixel(index : float) -> float {
+  return hash1(index * 0.618)
+}
+
+# ---- Colour -----------------------------------------------------------------
+
+fn hue_shift(h : float, by : float) -> float {
+  return fract(h + by)
+}
+
+fn contrast(v : float, amount : float) -> float {
+  return clamp((v - 0.5) * amount + 0.5, 0, 1)
+}

@@ -31,6 +31,8 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+
 pub mod ast;
 pub mod diag;
 pub mod emit;
@@ -38,6 +40,7 @@ pub mod fmt;
 pub mod lex;
 pub mod parse;
 pub mod resolve;
+pub mod stdlib;
 
 pub use diag::{Diagnostic, Diagnostics, Severity, Span};
 pub use parse::parse;
@@ -84,14 +87,76 @@ pub struct BudgetReport {
 /// see.
 pub fn compile(src: &str) -> (Option<emit::Compiled>, Diagnostics) {
     let (file, mut diags) = parse(src);
-    let Some(file) = file else {
+    let Some(mut file) = file else {
         return (None, diags);
     };
+    if !link_stdlib(&mut file, &mut diags) {
+        return (None, diags);
+    }
     let Some(resolved) = resolve::resolve(&file, &mut diags) else {
         return (None, diags);
     };
     let compiled = emit::emit(&resolved, &mut diags);
     (compiled, diags)
+}
+
+/// Bring the declared stdlib version into the file's own scope.
+///
+/// The stdlib is **compiled inline**, exactly like a function the author wrote,
+/// which is what keeps a `.lfx` file self-contained: referencing `ease_out` is
+/// not an external reference, because the definition is vendored into the
+/// compiler and is part of the pinned language version.
+///
+/// Unused functions cost nothing. The emitter inlines on demand, so a file that
+/// calls two stdlib functions carries two, not the whole library.
+fn link_stdlib(file: &mut ast::File, diags: &mut Diagnostics) -> bool {
+    let Some(effect) = file.decls.iter().find_map(|d| match d {
+        ast::Decl::Effect(e) => Some(e),
+        _ => None,
+    }) else {
+        // No effect is a problem, but it is `resolve`'s to report, with a better
+        // message than anything this function could give.
+        return true;
+    };
+    let version = effect
+        .stdlib
+        .map(|v| StdlibVersion(v as u16))
+        .unwrap_or(DEFAULT_STDLIB);
+
+    let Some(lib) = stdlib::load(version, diags) else {
+        return false;
+    };
+
+    // Palettes first, so a stdlib palette is visible to the effect that follows.
+    for p in lib.palettes {
+        file.decls.push(ast::Decl::Palette(p));
+    }
+    for d in &mut file.decls {
+        if let ast::Decl::Effect(e) = d {
+            // Prepended, so the library is declared first and a clashing user
+            // function is the one reported — at a span inside the file the
+            // author is actually looking at.
+            //
+            // Library spans are cleared for the same reason: they point into a
+            // different file, and rendering one against the user's source would
+            // put a caret at an arbitrary offset. An empty span is how
+            // `resolve` recognises a stdlib declaration when it explains the
+            // clash.
+            let mut fns: Vec<ast::FnDecl> = lib
+                .fns
+                .iter()
+                .cloned()
+                .map(|mut f| {
+                    f.span = Span::EMPTY;
+                    f
+                })
+                .collect();
+            fns.append(&mut e.fns);
+            e.fns = fns;
+            break;
+        }
+    }
+    true
 }
 
 /// Parse and reformat, for the editor's round trip.

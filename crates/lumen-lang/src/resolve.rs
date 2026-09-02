@@ -698,6 +698,20 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
         .stdlib
         .map(|v| crate::StdlibVersion(v as u16))
         .unwrap_or(crate::DEFAULT_STDLIB);
+    if !crate::stdlib::has(stdlib) {
+        let known: Vec<String> = crate::stdlib::available()
+            .iter()
+            .map(|v| alloc::format!("{}", v.0))
+            .collect();
+        r.diags.push(Diagnostic::error(
+            effect.span,
+            alloc::format!("this compiler does not have stdlib version {}", stdlib.0),
+            alloc::format!(
+                "it carries {}; update the compiler, or lower the `stdlib` line",
+                known.join(", ")
+            ),
+        ));
+    }
 
     if diags_has_errors(r.diags) {
         return None;
@@ -729,11 +743,17 @@ struct Resolver<'d> {
 impl Resolver<'_> {
     fn declare(&mut self, name: &str, sym: Symbol) {
         if let Some(prev) = self.symbols.get(name) {
-            let prev_span = prev.span;
+            // A stdlib declaration carries an empty span, because its real
+            // position is in a file the author cannot see.
+            let help = if prev.span == Span::EMPTY {
+                alloc::format!("`{name}` is already in the standard library; pick another name")
+            } else {
+                alloc::format!("the earlier declaration is at byte {}", prev.span.start)
+            };
             self.diags.push(Diagnostic::error(
                 sym.span,
                 alloc::format!("`{name}` is already declared"),
-                alloc::format!("the earlier declaration is at byte {}", prev_span.start),
+                help,
             ));
             return;
         }
