@@ -168,6 +168,51 @@ pub const CORE_FNS: &[Signature] = &[
         ret: Type::Float,
     },
     Signature {
+        name: "ceil",
+        arity: &[1],
+        ret: Type::Float,
+    },
+    Signature {
+        name: "round",
+        arity: &[1],
+        ret: Type::Float,
+    },
+    Signature {
+        name: "trunc",
+        arity: &[1],
+        ret: Type::Float,
+    },
+    Signature {
+        name: "sign",
+        arity: &[1],
+        ret: Type::Float,
+    },
+    Signature {
+        name: "mod",
+        arity: &[2],
+        ret: Type::Float,
+    },
+    Signature {
+        name: "tan",
+        arity: &[1],
+        ret: Type::Float,
+    },
+    Signature {
+        name: "distance",
+        arity: &[2],
+        ret: Type::Float,
+    },
+    Signature {
+        name: "normalize",
+        arity: &[1],
+        ret: Type::Vec3,
+    },
+    Signature {
+        name: "cross",
+        arity: &[2],
+        ret: Type::Vec3,
+    },
+    Signature {
         name: "floor",
         arity: &[1],
         ret: Type::Float,

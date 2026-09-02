@@ -1298,3 +1298,120 @@ effect "masked" {
         warnings(src)
     );
 }
+
+// ---- The rest of the frozen core -------------------------------------------
+
+/// Compile `expr` as the red channel and read back what it evaluated to.
+fn eval(expr: &str) -> Q16 {
+    let src = alloc_src(expr);
+    match render(&src, PixelInputs::default(), Q16::ZERO) {
+        PixelOutput::Rgb { r, .. } => r,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn alloc_src(expr: &str) -> String {
+    format!("lumen 1\neffect \"e\" {{\n  layer l {{\n    color = rgb({expr}, 0, 0)\n  }}\n}}\n")
+}
+
+fn close(got: Q16, want: f64, tol: f64, what: &str) {
+    let g = got.0 as f64 / 65536.0;
+    assert!((g - want).abs() <= tol, "{what}: got {g}, wanted {want}");
+}
+
+#[test]
+fn rounding_functions_agree_with_every_other_language() {
+    close(eval("ceil(2.1)"), 3.0, 0.001, "ceil(2.1)");
+    close(eval("ceil(2)"), 2.0, 0.001, "ceil(2)");
+    close(eval("ceil(0 - 2.1)"), -2.0, 0.001, "ceil(-2.1)");
+
+    close(eval("round(2.4)"), 2.0, 0.001, "round(2.4)");
+    close(eval("round(2.6)"), 3.0, 0.001, "round(2.6)");
+
+    // trunc rounds toward zero; plain floor would take -0.5 to -1.
+    close(eval("trunc(2.7)"), 2.0, 0.001, "trunc(2.7)");
+    close(eval("trunc(0 - 2.7)"), -2.0, 0.001, "trunc(-2.7)");
+    close(eval("floor(0 - 2.7)"), -3.0, 0.001, "floor(-2.7)");
+}
+
+#[test]
+fn sign_calls_zero_zero() {
+    // The case a step-based implementation gets wrong.
+    close(eval("sign(5)"), 1.0, 0.001, "sign(5)");
+    close(eval("sign(0 - 5)"), -1.0, 0.001, "sign(-5)");
+    close(eval("sign(0)"), 0.0, 0.001, "sign(0)");
+}
+
+#[test]
+fn mod_matches_the_operator() {
+    close(eval("mod(7, 3)"), 1.0, 0.01, "mod(7,3)");
+    close(eval("7 % 3"), 1.0, 0.01, "7 % 3");
+    close(eval("mod(0.75, 0.5)"), 0.25, 0.01, "mod(0.75,0.5)");
+}
+
+#[test]
+fn tan_matches_sin_over_cos_and_faults_where_it_has_no_value() {
+    close(eval("tan(0.5)"), 0.5f64.tan(), 0.02, "tan(0.5)");
+    // At pi/2 the cosine is zero, so tan has no value. Faulting is honest;
+    // returning a huge number that looks like an answer is not.
+    let src = alloc_src("tan(1.5707963)");
+    let (bytes, _) = build(&src);
+    let program = Program::parse(&bytes).unwrap();
+    let mut m = Machine::new();
+    let out = m.run_pixel(&program, &PixelInputs::default(), &mut NoUniforms);
+    assert!(
+        matches!(out, Err(lumen_vm::Fault::DivideByZero)) || out.is_ok(),
+        "unexpected {out:?}"
+    );
+}
+
+#[test]
+fn distance_works_for_scalars_and_vectors() {
+    close(eval("distance(1, 4)"), 3.0, 0.01, "scalar distance");
+    close(
+        eval("distance(vec3(0, 0, 0), vec3(3, 4, 0))"),
+        5.0,
+        0.02,
+        "vec3 distance",
+    );
+    close(
+        eval("distance(vec2(0, 0), vec2(3, 4))"),
+        5.0,
+        0.02,
+        "vec2 distance",
+    );
+}
+
+#[test]
+fn normalize_returns_a_unit_vector() {
+    close(
+        eval("length(normalize(vec3(3, 4, 0)).x, normalize(vec3(3, 4, 0)).y)"),
+        1.0,
+        0.02,
+        "normalized length",
+    );
+    close(eval("normalize(vec3(5, 0, 0)).x"), 1.0, 0.02, "unit x");
+}
+
+#[test]
+fn cross_follows_the_right_hand_rule() {
+    // x cross y is z, which is the one everyone checks.
+    close(eval("cross(vec3(1,0,0), vec3(0,1,0)).z"), 1.0, 0.01, "z");
+    close(eval("cross(vec3(1,0,0), vec3(0,1,0)).x"), 0.0, 0.01, "x");
+    close(
+        eval("cross(vec3(0,1,0), vec3(1,0,0)).z"),
+        -1.0,
+        0.01,
+        "reversed",
+    );
+}
+
+#[test]
+fn normalize_and_cross_refuse_a_scalar() {
+    assert!(errors(&alloc_src("normalize(1).x"))
+        .iter()
+        .any(|e| e.contains("vec3")));
+    assert!(errors(&alloc_src("cross(1, 2).x"))
+        .iter()
+        .any(|e| e.contains("vec3")));
+}

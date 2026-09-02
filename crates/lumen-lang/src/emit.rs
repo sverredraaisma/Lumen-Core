@@ -892,6 +892,81 @@ impl Emitter<'_, '_> {
                 );
                 return Some(dst);
             }
+            // Vector forms. Each needs its operands as a contiguous run before
+            // the instruction can read them, so they cannot go through the
+            // scalar path below.
+            "distance" => {
+                let (a, b) = (vals[0], vals[1]);
+                let width = a.width.max(b.width);
+                let diff = self.temp(width)?;
+                for k in 0..width {
+                    self.push(
+                        rate,
+                        Instruction::new(OpCode::Sub, diff.base + k, a.at(k), b.at(k)),
+                    );
+                }
+                let dst = self.temp(1)?;
+                let ins = match width {
+                    3 => Instruction::new(OpCode::Len3, dst.base, diff.base, 0),
+                    2 => Instruction::new(OpCode::Len2, dst.base, diff.base, diff.base + 1),
+                    // A scalar distance is the magnitude of the gap.
+                    _ => Instruction::new(OpCode::Abs, dst.base, diff.base, 0),
+                };
+                self.push(rate, ins);
+                return Some(dst);
+            }
+            "normalize" => {
+                let v = vals[0];
+                if v.width != 3 {
+                    self.diags.push(Diagnostic::error(
+                        e.span,
+                        "`normalize` takes a vec3",
+                        "build one with `vec3(x, y, z)`",
+                    ));
+                    return None;
+                }
+                let len = self.temp(1)?;
+                self.push(rate, Instruction::new(OpCode::Len3, len.base, v.base, 0));
+                let dst = self.temp(3)?;
+                for k in 0..3 {
+                    self.push(
+                        rate,
+                        Instruction::new(OpCode::Div, dst.base + k, v.at(k), len.base),
+                    );
+                }
+                return Some(dst);
+            }
+            "cross" => {
+                let (a, b) = (vals[0], vals[1]);
+                if a.width != 3 || b.width != 3 {
+                    self.diags.push(Diagnostic::error(
+                        e.span,
+                        "`cross` takes two vec3 values",
+                        "build them with `vec3(x, y, z)`",
+                    ));
+                    return None;
+                }
+                let dst = self.temp(3)?;
+                let t = self.temp(2)?;
+                // Written out rather than looped: three components, and there is
+                // no loop construct to lower it to anyway.
+                for (k, (i, j)) in [(1u8, 2u8), (2, 0), (0, 1)].into_iter().enumerate() {
+                    let k = k as u8;
+                    self.push(
+                        rate,
+                        Instruction::new(OpCode::Mul, t.base, a.at(i), b.at(j)),
+                    );
+                    self.push(
+                        rate,
+                        Instruction::new(OpCode::Mul, t.base + 1, a.at(j), b.at(i)),
+                    );
+                    self.push(
+                        rate,
+                        Instruction::new(OpCode::Sub, dst.base + k, t.base, t.base + 1),
+                    );
+                }
+                return Some(dst);
+            }
             _ => {}
         }
 
@@ -904,13 +979,85 @@ impl Emitter<'_, '_> {
         // last argument while the destination would land on the first. Reusing
         // there overwrites `e0` before the instruction reads it - which showed
         // up as smoothstep falling instead of rising.
-        let reuses_scratch = vals.iter().all(|v| v.width == 1) && callee != "smoothstep";
+        // Only the arms that emit a SINGLE instruction may reuse the argument
+        // scratch. A multi-instruction sequence allocates further temporaries
+        // that land on the arguments it has still to read - `mod` clobbered its
+        // own divisor that way and returned the dividend.
+        //
+        // `smoothstep` is excluded for a different reason: it follows GLSL, so
+        // its value is the last argument while the destination lands on the
+        // first, overwriting `e0` before the instruction reads it.
+        let multi_instruction = matches!(
+            callee,
+            "ceil" | "round" | "trunc" | "sign" | "mod" | "tan" | "smoothstep"
+        );
+        let reuses_scratch = vals.iter().all(|v| v.width == 1) && !multi_instruction;
         if reuses_scratch {
             self.release_to(mark);
         }
         let dst = self.temp(1)?;
         let ins = match callee {
             "abs" => Instruction::new(OpCode::Abs, dst.base, vals[0].base, 0),
+            // No dedicated instruction for any of these: the instruction set is
+            // frozen, and each is a couple of cheap ones. Capability grows in
+            // the standard library, not in the VM.
+            "ceil" => {
+                // -floor(-x)
+                self.push(
+                    rate,
+                    Instruction::new(OpCode::Neg, dst.base, vals[0].base, 0),
+                );
+                self.push(rate, Instruction::new(OpCode::Floor, dst.base, dst.base, 0));
+                Instruction::new(OpCode::Neg, dst.base, dst.base, 0)
+            }
+            "round" => {
+                let half = self.constant(0.5);
+                let t = self.temp(1)?;
+                self.push(rate, Instruction::with_imm(OpCode::LoadK, t.base, half));
+                self.push(
+                    rate,
+                    Instruction::new(OpCode::Add, dst.base, vals[0].base, t.base),
+                );
+                Instruction::new(OpCode::Floor, dst.base, dst.base, 0)
+            }
+            "trunc" => {
+                // Rounds toward zero, so it is floor of the magnitude with the
+                // sign put back. Plain floor would take -0.5 to -1.
+                let t = self.temp(2)?;
+                self.push(rate, Instruction::new(OpCode::Abs, t.base, vals[0].base, 0));
+                self.push(rate, Instruction::new(OpCode::Floor, t.base, t.base, 0));
+                self.sign_into(rate, t.base + 1, vals[0].base)?;
+                Instruction::new(OpCode::Mul, dst.base, t.base, t.base + 1)
+            }
+            "sign" => {
+                self.sign_into(rate, dst.base, vals[0].base)?;
+                Instruction::new(OpCode::Mov, dst.base, dst.base, 0)
+            }
+            "mod" => {
+                let t = self.temp(2)?;
+                self.push(
+                    rate,
+                    Instruction::new(OpCode::Div, t.base, vals[0].base, vals[1].base),
+                );
+                self.push(rate, Instruction::new(OpCode::Floor, t.base, t.base, 0));
+                self.push(
+                    rate,
+                    Instruction::new(OpCode::Mul, t.base + 1, t.base, vals[1].base),
+                );
+                Instruction::new(OpCode::Sub, dst.base, vals[0].base, t.base + 1)
+            }
+            "tan" => {
+                // sin/cos. It faults where cos is zero, which is exactly where
+                // tan has no value - better than a huge number that looks like
+                // an answer.
+                let t = self.temp(2)?;
+                self.push(rate, Instruction::new(OpCode::Sin, t.base, vals[0].base, 0));
+                self.push(
+                    rate,
+                    Instruction::new(OpCode::Cos, t.base + 1, vals[0].base, 0),
+                );
+                Instruction::new(OpCode::Div, dst.base, t.base, t.base + 1)
+            }
             "floor" => Instruction::new(OpCode::Floor, dst.base, vals[0].base, 0),
             "fract" => Instruction::new(OpCode::Fract, dst.base, vals[0].base, 0),
             "sqrt" => Instruction::new(OpCode::Sqrt, dst.base, vals[0].base, 0),
@@ -966,6 +1113,21 @@ impl Emitter<'_, '_> {
         Some(dst)
     }
 
+    /// `dst = sign(src)`: -1, 0 or +1.
+    ///
+    /// `(x > 0) - (x < 0)`, which is branch-free and gets zero right. A
+    /// step-based version would call zero positive, and `sign(0) == 0` is what
+    /// every other language means by it.
+    fn sign_into(&mut self, rate: Rate, dst: u8, src: u8) -> Option<()> {
+        let zero = self.constant(0.0);
+        let t = self.temp(2)?;
+        self.push(rate, Instruction::with_imm(OpCode::LoadK, t.base, zero));
+        self.push(rate, Instruction::new(OpCode::Gt, dst, src, t.base));
+        self.push(rate, Instruction::new(OpCode::Lt, t.base + 1, src, t.base));
+        self.push(rate, Instruction::new(OpCode::Sub, dst, dst, t.base + 1));
+        Some(())
+    }
+
     fn binary(&mut self, rate: Rate, op: BinOp, lhs: &Expr, rhs: &Expr) -> Option<Val> {
         let mark = self.next_temp;
         let a = self.expr(rate, lhs)?;
@@ -976,7 +1138,11 @@ impl Emitter<'_, '_> {
         // broadcasting operand the destination would overwrite a value later
         // components still need to read. Scalars are the overwhelming majority
         // of an effect, and without this a handful of layers exhausts the file.
-        let dst = if width == 1 && a.width == 1 && b.width == 1 {
+        // `%` lowers to four instructions and needs scratch of its own, which
+        // would land on the divisor it has still to read. Everything else here
+        // is one instruction that reads its sources before writing.
+        let single_instruction = op != BinOp::Rem;
+        let dst = if width == 1 && a.width == 1 && b.width == 1 && single_instruction {
             self.release_to(mark);
             self.temp(1)?
         } else {
