@@ -137,6 +137,99 @@ impl Uniforms for NoUniforms {
     }
 }
 
+/// Bounded arrays for the `sim` profile.
+///
+/// A trait so the simulator, the sim master and a test can each hold the state
+/// their own way. Deliberately narrow: load, store, length. There is no way to
+/// allocate, resize, or take a reference — the sim profile adds bounded arrays
+/// and `FOREACH` over them and *nothing else*, and a wider trait here would be
+/// the crack that lets dynamic structures in.
+pub trait Arrays {
+    /// Number of elements in `array`, or `None` if there is no such array.
+    fn len(&self, array: u8) -> Option<usize>;
+
+    /// Read one element. Out of range is a fault, never a wrap.
+    fn load(&self, array: u8, index: usize) -> Result<Q16, Fault>;
+
+    /// Write one element.
+    fn store(&mut self, array: u8, index: usize, value: Q16) -> Result<(), Fault>;
+}
+
+/// No arrays at all. What a `pixel` program gets.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct NoArrays;
+
+impl Arrays for NoArrays {
+    fn len(&self, _array: u8) -> Option<usize> {
+        None
+    }
+    fn load(&self, _array: u8, _index: usize) -> Result<Q16, Fault> {
+        Err(Fault::OutOfBounds)
+    }
+    fn store(&mut self, _array: u8, _index: usize, _value: Q16) -> Result<(), Fault> {
+        Err(Fault::OutOfBounds)
+    }
+}
+
+/// Arrays laid out end to end in one flat slice.
+///
+/// Flat on purpose: **sim state must be serialisable**, because it is broadcast
+/// every frame and handed over on sim-master failover. A contiguous run of `Q16`
+/// is already its own wire format, so a new master can resume from a snapshot
+/// instead of restarting the simulation visibly.
+#[derive(Debug)]
+pub struct SliceArrays<'a> {
+    storage: &'a mut [Q16],
+    /// `(offset, len)` per array, in declaration order.
+    layout: &'a [(usize, usize)],
+}
+
+impl<'a> SliceArrays<'a> {
+    /// Wrap a flat buffer with a layout. Returns `None` if the layout does not
+    /// fit, which is a compiler bug rather than a runtime condition — but
+    /// checking once here means the accessors below never have to.
+    pub fn new(storage: &'a mut [Q16], layout: &'a [(usize, usize)]) -> Option<SliceArrays<'a>> {
+        for &(offset, len) in layout {
+            if offset.checked_add(len)? > storage.len() {
+                return None;
+            }
+        }
+        Some(SliceArrays { storage, layout })
+    }
+
+    /// The whole buffer, ready to broadcast or snapshot.
+    pub fn as_slice(&self) -> &[Q16] {
+        self.storage
+    }
+
+    fn span(&self, array: u8) -> Option<(usize, usize)> {
+        self.layout.get(array as usize).copied()
+    }
+}
+
+impl Arrays for SliceArrays<'_> {
+    fn len(&self, array: u8) -> Option<usize> {
+        self.span(array).map(|(_, len)| len)
+    }
+
+    fn load(&self, array: u8, index: usize) -> Result<Q16, Fault> {
+        let (offset, len) = self.span(array).ok_or(Fault::OutOfBounds)?;
+        if index >= len {
+            return Err(Fault::OutOfBounds);
+        }
+        Ok(self.storage[offset + index])
+    }
+
+    fn store(&mut self, array: u8, index: usize, value: Q16) -> Result<(), Fault> {
+        let (offset, len) = self.span(array).ok_or(Fault::OutOfBounds)?;
+        if index >= len {
+            return Err(Fault::OutOfBounds);
+        }
+        self.storage[offset + index] = value;
+        Ok(())
+    }
+}
+
 /// The register machine.
 #[derive(Clone, Debug)]
 pub struct Machine {
@@ -227,7 +320,8 @@ impl Machine {
         program: &Program<'_>,
         uniforms: &mut U,
     ) -> Result<(), Fault> {
-        self.execute(program, Section::Once, uniforms).map(|_| ())
+        self.execute(program, Section::Once, uniforms, &mut NoArrays)
+            .map(|_| ())
     }
 
     /// Run the `frame` section. Call once per frame, before any pixel.
@@ -239,7 +333,8 @@ impl Machine {
         program: &Program<'_>,
         uniforms: &mut U,
     ) -> Result<(), Fault> {
-        self.execute(program, Section::Frame, uniforms).map(|_| ())
+        self.execute(program, Section::Frame, uniforms, &mut NoArrays)
+            .map(|_| ())
     }
 
     /// Run the `frame` section at show time `t`, in seconds.
@@ -264,7 +359,28 @@ impl Machine {
         uniforms: &mut U,
     ) -> Result<PixelOutput, Fault> {
         self.load_inputs(inputs);
-        self.execute(program, Section::Pixel, uniforms)
+        self.execute(program, Section::Pixel, uniforms, &mut NoArrays)
+    }
+
+    /// Run a `sim` program's `frame` section against its array bank.
+    ///
+    /// Sims run once per frame on the sim master only, and their whole output is
+    /// the array state, which is then broadcast as a channel. Determinism is not
+    /// optional here: same starting state plus same inputs must give the same
+    /// result on any device, or replay and sim-master failover both stop working.
+    pub fn run_sim<U: Uniforms, A: Arrays>(
+        &mut self,
+        program: &Program<'_>,
+        t: Q16,
+        uniforms: &mut U,
+        arrays: &mut A,
+    ) -> Result<(), Fault> {
+        if program.profile != crate::Profile::Sim {
+            return Err(Fault::BadProgram);
+        }
+        self.regs[R_T as usize] = t;
+        self.execute(program, Section::Frame, uniforms, arrays)
+            .map(|_| ())
     }
 
     fn charge(&mut self, cost: u32) -> Result<(), Fault> {
@@ -275,11 +391,12 @@ impl Machine {
         Ok(())
     }
 
-    fn execute<U: Uniforms>(
+    fn execute<U: Uniforms, A: Arrays>(
         &mut self,
         program: &Program<'_>,
         section: Section,
         uniforms: &mut U,
+        arrays: &mut A,
     ) -> Result<PixelOutput, Fault> {
         self.spent = 0;
         self.repeat_depth = 0;
@@ -292,7 +409,7 @@ impl Machine {
             let ins = program.instruction(section, pc).ok_or(Fault::BadProgram)?;
             self.charge(ins.op.cost())?;
             pc += 1;
-            match self.step(program, section, ins, uniforms, &mut pc, &mut out)? {
+            match self.step(program, section, ins, uniforms, arrays, &mut pc, &mut out)? {
                 Flow::Continue => {}
                 Flow::Halt => break,
             }
@@ -328,12 +445,14 @@ impl Machine {
         Ok(())
     }
 
-    fn step<U: Uniforms>(
+    #[allow(clippy::too_many_arguments)]
+    fn step<U: Uniforms, A: Arrays>(
         &mut self,
         program: &Program<'_>,
         section: Section,
         ins: Instruction,
         uniforms: &mut U,
+        arrays: &mut A,
         pc: &mut usize,
         out: &mut PixelOutput,
     ) -> Result<Flow, Fault> {
@@ -569,11 +688,28 @@ impl Machine {
                 *pc = self.calls[self.call_depth];
             }
             Halt => return Ok(Flow::Halt),
-            ALoad | AStore | ALen => {
-                // Structurally excluded from `pixel` programs at load. A `sim`
-                // machine with an array bank implements these; reaching here
-                // means one was run without one.
-                return Err(Fault::UnsupportedInstruction(ins.op.to_u8()));
+            ALoad => {
+                // Index is a value, so the bound check is at execution. Out of
+                // range faults rather than wrapping: a wrapped index reads a
+                // neighbouring particle and the simulation quietly goes wrong.
+                let index = self.reg(c)?.to_int();
+                if index < 0 {
+                    return Err(Fault::OutOfBounds);
+                }
+                let v = arrays.load(b, index as usize)?;
+                self.put(a, v)?;
+            }
+            AStore => {
+                let index = self.reg(b)?.to_int();
+                if index < 0 {
+                    return Err(Fault::OutOfBounds);
+                }
+                let v = self.reg(c)?;
+                arrays.store(a, index as usize, v)?;
+            }
+            ALen => {
+                let n = arrays.len(b).ok_or(Fault::OutOfBounds)?;
+                self.put(a, Q16::from_int(n as i16))?;
             }
             Probe => {
                 let v = self.reg(a)?;

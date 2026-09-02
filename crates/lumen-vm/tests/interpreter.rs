@@ -9,8 +9,8 @@ use lumen_vm::program::builder::ProgramBuilder;
 use lumen_vm::program::{Program, ProgramError, Section, MAGIC, PALETTE_STOPS, VM_VERSION};
 use lumen_vm::q16::Q16;
 use lumen_vm::vm::{
-    hsv_to_rgb, kelvin_to_rgb, rgb_to_hsv, Machine, NoUniforms, PixelInputs, PixelOutput, Uniforms,
-    R_I, R_SCRATCH, R_T, R_U, R_X,
+    hsv_to_rgb, kelvin_to_rgb, rgb_to_hsv, Arrays, Machine, NoArrays, NoUniforms, PixelInputs,
+    PixelOutput, SliceArrays, Uniforms, R_I, R_SCRATCH, R_T, R_U, R_X,
 };
 use lumen_vm::{Fault, Profile};
 
@@ -1019,4 +1019,191 @@ fn a_plane_sweeping_through_a_room_is_a_pure_function_of_position_and_time() {
     // And the plane actually moves.
     let later = render(&[0, 1, 2, 3, 4], t.add(Q16::ONE));
     assert_ne!(device_a, later);
+}
+
+// ---- The sim profile -------------------------------------------------------
+
+#[test]
+fn a_sim_program_reads_and_writes_its_arrays() {
+    // Particles as a flat array: read element 0, add one, write it back. This is
+    // the shape every simulation has.
+    let mut b = ProgramBuilder::new();
+    b.profile_sim = true;
+    let one = b.constant(Q16::ONE);
+    let zero = b.constant(Q16::ZERO);
+    b.push(
+        Section::Frame,
+        Instruction::with_imm(OpCode::LoadK, 20, zero),
+    );
+    b.push(Section::Frame, Instruction::new(OpCode::ALoad, 21, 0, 20));
+    b.push(
+        Section::Frame,
+        Instruction::with_imm(OpCode::LoadK, 22, one),
+    );
+    b.push(Section::Frame, Instruction::new(OpCode::Add, 21, 21, 22));
+    b.push(Section::Frame, Instruction::new(OpCode::AStore, 0, 20, 21));
+    let bytes = b.build();
+    let program = Program::parse(&bytes).unwrap();
+
+    let mut storage = [Q16::ZERO; 4];
+    let layout = [(0usize, 4usize)];
+    let mut m = Machine::new();
+    for expect in 1..=3 {
+        let mut arrays = SliceArrays::new(&mut storage, &layout).unwrap();
+        m.run_sim(&program, Q16::ZERO, &mut NoUniforms, &mut arrays)
+            .unwrap();
+        assert_eq!(storage[0], Q16::from_int(expect));
+    }
+}
+
+#[test]
+fn alen_reports_the_declared_length() {
+    let mut b = ProgramBuilder::new();
+    b.profile_sim = true;
+    b.push(Section::Frame, Instruction::new(OpCode::ALen, 20, 1, 0));
+    let bytes = b.build();
+    let program = Program::parse(&bytes).unwrap();
+
+    let mut storage = [Q16::ZERO; 10];
+    let layout = [(0usize, 4usize), (4usize, 6usize)];
+    let mut arrays = SliceArrays::new(&mut storage, &layout).unwrap();
+    let mut m = Machine::new();
+    m.run_sim(&program, Q16::ZERO, &mut NoUniforms, &mut arrays)
+        .unwrap();
+    assert_eq!(m.register(20), Some(Q16::from_int(6)));
+}
+
+#[test]
+fn an_out_of_range_index_faults_rather_than_wrapping() {
+    // A wrapped index reads a neighbouring particle and the simulation quietly
+    // goes wrong, which is the worst possible failure mode for something whose
+    // output is broadcast to every device.
+    let mut b = ProgramBuilder::new();
+    b.profile_sim = true;
+    let big = b.constant(Q16::from_int(999));
+    b.push(
+        Section::Frame,
+        Instruction::with_imm(OpCode::LoadK, 20, big),
+    );
+    b.push(Section::Frame, Instruction::new(OpCode::ALoad, 21, 0, 20));
+    let bytes = b.build();
+    let program = Program::parse(&bytes).unwrap();
+
+    let mut storage = [Q16::ZERO; 4];
+    let layout = [(0usize, 4usize)];
+    let mut arrays = SliceArrays::new(&mut storage, &layout).unwrap();
+    let mut m = Machine::new();
+    assert_eq!(
+        m.run_sim(&program, Q16::ZERO, &mut NoUniforms, &mut arrays),
+        Err(Fault::OutOfBounds)
+    );
+}
+
+#[test]
+fn a_negative_index_faults() {
+    let mut b = ProgramBuilder::new();
+    b.profile_sim = true;
+    let neg = b.constant(Q16::from_int(-1));
+    b.push(
+        Section::Frame,
+        Instruction::with_imm(OpCode::LoadK, 20, neg),
+    );
+    b.push(Section::Frame, Instruction::new(OpCode::ALoad, 21, 0, 20));
+    let bytes = b.build();
+    let program = Program::parse(&bytes).unwrap();
+
+    let mut storage = [Q16::ZERO; 4];
+    let layout = [(0usize, 4usize)];
+    let mut arrays = SliceArrays::new(&mut storage, &layout).unwrap();
+    let mut m = Machine::new();
+    assert_eq!(
+        m.run_sim(&program, Q16::ZERO, &mut NoUniforms, &mut arrays),
+        Err(Fault::OutOfBounds)
+    );
+}
+
+#[test]
+fn an_unknown_array_faults() {
+    let mut b = ProgramBuilder::new();
+    b.profile_sim = true;
+    b.push(Section::Frame, Instruction::new(OpCode::ALen, 20, 7, 0));
+    let bytes = b.build();
+    let program = Program::parse(&bytes).unwrap();
+
+    let mut storage = [Q16::ZERO; 4];
+    let layout = [(0usize, 4usize)];
+    let mut arrays = SliceArrays::new(&mut storage, &layout).unwrap();
+    let mut m = Machine::new();
+    assert_eq!(
+        m.run_sim(&program, Q16::ZERO, &mut NoUniforms, &mut arrays),
+        Err(Fault::OutOfBounds)
+    );
+}
+
+#[test]
+fn a_pixel_program_cannot_be_run_as_a_sim() {
+    let bytes = pixel_program(|b| {
+        b.push(Section::Frame, Instruction::new(OpCode::Nop, 0, 0, 0));
+    });
+    let program = Program::parse(&bytes).unwrap();
+    let mut storage = [Q16::ZERO; 1];
+    let layout = [(0usize, 1usize)];
+    let mut arrays = SliceArrays::new(&mut storage, &layout).unwrap();
+    let mut m = Machine::new();
+    assert_eq!(
+        m.run_sim(&program, Q16::ZERO, &mut NoUniforms, &mut arrays),
+        Err(Fault::BadProgram)
+    );
+}
+
+#[test]
+fn a_layout_that_does_not_fit_its_storage_is_refused_up_front() {
+    let mut storage = [Q16::ZERO; 4];
+    assert!(SliceArrays::new(&mut storage, &[(0usize, 5usize)]).is_none());
+    assert!(SliceArrays::new(&mut storage, &[(3usize, 2usize)]).is_none());
+    assert!(SliceArrays::new(&mut storage, &[(0usize, 2usize), (2usize, 2usize)]).is_some());
+}
+
+#[test]
+fn sim_state_is_a_flat_slice_ready_to_broadcast() {
+    // It is broadcast every frame and handed over on failover, so it has to be
+    // its own wire format rather than something that needs serialising.
+    let mut storage = [Q16::ONE; 4];
+    let layout = [(0usize, 4usize)];
+    let arrays = SliceArrays::new(&mut storage, &layout).unwrap();
+    assert_eq!(arrays.as_slice().len(), 4);
+    assert_eq!(arrays.as_slice()[0], Q16::ONE);
+}
+
+#[test]
+fn a_sim_is_deterministic_from_the_same_starting_state() {
+    // What replay and sim-master failover both rest on.
+    let mut b = ProgramBuilder::new();
+    b.profile_sim = true;
+    b.push(Section::Frame, Instruction::new(OpCode::ALoad, 20, 0, 20));
+    b.push(Section::Frame, Instruction::new(OpCode::Noise1, 21, 20, 0));
+    b.push(Section::Frame, Instruction::new(OpCode::AStore, 0, 20, 21));
+    let bytes = b.build();
+    let program = Program::parse(&bytes).unwrap();
+    let layout = [(0usize, 4usize)];
+
+    let run = || {
+        let mut storage = [Q16::HALF; 4];
+        let mut m = Machine::new();
+        for _ in 0..5 {
+            let mut arrays = SliceArrays::new(&mut storage, &layout).unwrap();
+            m.run_sim(&program, Q16::ZERO, &mut NoUniforms, &mut arrays)
+                .unwrap();
+        }
+        storage
+    };
+    assert_eq!(run(), run());
+}
+
+#[test]
+fn no_arrays_refuses_every_access() {
+    let mut none = NoArrays;
+    assert_eq!(none.len(0), None);
+    assert_eq!(none.load(0, 0), Err(Fault::OutOfBounds));
+    assert_eq!(none.store(0, 0, Q16::ONE), Err(Fault::OutOfBounds));
 }

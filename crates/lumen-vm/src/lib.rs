@@ -50,7 +50,7 @@ pub mod vm;
 pub use isa::{Instruction, OpCode, Reg};
 pub use program::{Program, ProgramError, Section};
 pub use q16::Q16;
-pub use vm::{Machine, PixelInputs, PixelOutput, Uniforms};
+pub use vm::{Arrays, Machine, NoArrays, PixelInputs, PixelOutput, SliceArrays, Uniforms};
 
 /// Which machine a program was compiled for.
 ///
