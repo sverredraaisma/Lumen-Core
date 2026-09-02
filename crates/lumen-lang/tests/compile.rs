@@ -1588,3 +1588,58 @@ fn a_bare_hash_is_a_comment_and_not_a_colour() {
     assert!(!diags.has_errors(), "{}", diags.render(src));
     assert!(out.unwrap().contains('#'));
 }
+
+#[test]
+fn a_trailing_comment_stays_with_the_line_it_followed() {
+    // Reported from the effects corpus: it landed on the line BELOW, so it
+    // documented the next item instead. That is worse than losing it, because a
+    // wrong explanation reads as true.
+    let src = "lumen 1\neffect \"x\" {\n  param a : float = 0.5 range 0..1 # how bright\n  param b : float = 0.5 range 0..1\n  layer l { color = rgb(a, b, 0) }\n}\n";
+    let (out, diags) = format_source(src);
+    assert!(!diags.has_errors(), "{}", diags.render(src));
+    let out = out.unwrap();
+    let comment = out.find("# how bright").expect("lost the comment");
+    let param_a = out.find("param a").expect("lost a");
+    let param_b = out.find("param b").expect("lost b");
+    assert!(param_a < comment, "the comment moved above its own line");
+    assert!(comment < param_b, "the comment now documents `b`");
+}
+
+#[test]
+fn a_trailing_comment_does_not_escape_its_block() {
+    // Also reported: at file scope it reappeared after the closing brace, next
+    // to whatever declaration followed.
+    let src = "lumen 1\neffect \"one\" {\n  layer l { color = rgb(1, 0, 0) } # inside\n}\n\neffect \"two\" {\n  layer l { color = rgb(0, 1, 0) }\n}\n";
+    let (out, _) = format_source(src);
+    let out = out.unwrap();
+    let comment = out.find("# inside").expect("lost the comment");
+    let second = out.find("effect \"two\"").expect("lost the second effect");
+    assert!(comment < second, "the comment escaped into the next effect");
+}
+
+#[test]
+fn a_blank_line_between_comment_blocks_survives() {
+    // A file header run together with the note on the declaration below reads as
+    // documenting only that declaration.
+    let src = "lumen 1\n\n# A file header.\n# Second line of it.\n\n# About this effect.\neffect \"x\" {\n  layer l { color = rgb(1, 0, 0) }\n}\n";
+    let (out, _) = format_source(src);
+    let out = out.unwrap();
+    let header_end = out.find("# Second line of it.").expect("lost the header");
+    let about = out.find("# About this effect.").expect("lost the note");
+    let between = &out[header_end..about];
+    assert!(
+        between.contains("\n\n"),
+        "the blank line between the blocks was dropped:\n{out}"
+    );
+}
+
+#[test]
+fn placement_survives_a_second_format() {
+    // Whatever the placement is, it has to be stable, or every save moves a
+    // comment one line further from what it explains.
+    let src = "lumen 1\n\n# header\n\n# note\neffect \"x\" {\n  param a : float = 1 range 0..2 # trailing\n  layer l { color = rgb(a, 0, 0) } # inner\n}\n# end\n";
+    let (once, _) = format_source(src);
+    let once = once.unwrap();
+    let (twice, _) = format_source(&once);
+    assert_eq!(once, twice.unwrap(), "placement moved on the second pass");
+}

@@ -174,9 +174,15 @@ pub struct Comment {
     ///
     /// A trailing comment belongs to the line it follows; a standalone one
     /// belongs to whatever comes next. Getting this wrong moves a comment away
-    /// from the thing it explains, which is worse than losing it - a wrong
+    /// from the thing it explains, which is worse than losing it — a wrong
     /// explanation reads as true.
     pub own_line: bool,
+    /// True when a blank line separated this comment from whatever preceded it.
+    ///
+    /// Needed to keep a file-level header apart from the comment on the
+    /// declaration below it. Run together, the header reads as documenting that
+    /// one declaration rather than the file.
+    pub blank_before: bool,
 }
 
 /// Turn source text into tokens.
@@ -300,6 +306,15 @@ impl<'a> Lexer<'a> {
             // where the comment belongs when the file is reformatted.
             let line_start = self.text[..start].rfind('\n').map_or(0, |i| i + 1);
             let own_line = self.text[line_start..start].trim().is_empty();
+            // A blank line before it means the line above held nothing. Without
+            // this a file header runs into the comment on the declaration below
+            // and then reads as documenting only that declaration.
+            let blank_before = own_line
+                && line_start > 0
+                && self.text[..line_start - 1]
+                    .rfind('\n')
+                    .map(|prev| self.text[prev + 1..line_start - 1].trim().is_empty())
+                    .unwrap_or(false);
             self.pos += 1; // the `#`
             let from = self.pos;
             while self.pos < self.src.len() && self.peek() != b'\n' {
@@ -311,6 +326,7 @@ impl<'a> Lexer<'a> {
                 text: text.into(),
                 span: Span::new(start, self.pos),
                 own_line,
+                blank_before,
             });
         }
     }

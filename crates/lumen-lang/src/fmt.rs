@@ -38,28 +38,75 @@ impl<'a> Comments<'a> {
     }
 
     /// Write out every comment that began before `at`.
+    /// Only comments on their own line are taken here.
+    ///
+    /// A trailing comment belongs to the item that was just written and is
+    /// drained by [`Comments::flush_trailing`]. Taking it here would put it
+    /// above the *next* item, where it documents something it says nothing
+    /// about — worse than losing it, because a wrong explanation reads as true.
     fn flush_before(&mut self, out: &mut String, at: usize, depth: usize) {
         while let Some(c) = self.items.get(self.next) {
-            if c.span.start >= at {
+            if c.span.start >= at || !c.own_line {
                 return;
             }
+            let (text, blank_before) = (c.text.clone(), c.blank_before);
             self.next += 1;
-            // A comment that trailed code goes on its own line here. Keeping it
-            // trailing would need to know which line the code landed on after
-            // reformatting, and a comment on the wrong line reads as explaining
-            // something it does not.
-            indent(out, depth);
-            if c.text.is_empty() {
-                out.push_str("#\n");
-            } else {
-                out.push_str(&format!("# {}\n", c.text));
+            // A blank line the author left between two comment blocks is what
+            // separates a file header from the note on the declaration below
+            // it. Run together, the header reads as documenting only that one.
+            if blank_before && !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
             }
+            write_comment(out, &text, depth);
+        }
+    }
+
+    /// Put back the comment that trailed the line just written.
+    ///
+    /// Kept **trailing**, on the same line, which is where the author put it. An
+    /// earlier version moved it to its own line on the grounds that the
+    /// formatter could not know where the code landed — but the formatter is
+    /// what decides where the code lands, so it knows exactly. Moving it put it
+    /// above the *next* item, where it documented something it says nothing
+    /// about, and the placement then shifted again on every subsequent format.
+    ///
+    /// At most one, because a line can only have one: a second `#` on the same
+    /// line is part of the first comment's text.
+    fn flush_trailing(&mut self, out: &mut String) {
+        let Some(c) = self.items.get(self.next) else {
+            return;
+        };
+        if c.own_line {
+            return;
+        }
+        let text = c.text.clone();
+        self.next += 1;
+        if out.ends_with('\n') {
+            out.pop();
+        }
+        if text.is_empty() {
+            out.push_str(" #\n");
+        } else {
+            out.push_str(&format!(" # {text}\n"));
         }
     }
 
     /// Everything left, for the end of the file.
     fn flush_rest(&mut self, out: &mut String) {
-        self.flush_before(out, usize::MAX, 0);
+        while self.next < self.items.len() {
+            let text = self.items[self.next].text.clone();
+            self.next += 1;
+            write_comment(out, &text, 0);
+        }
+    }
+}
+
+fn write_comment(out: &mut String, text: &str, depth: usize) {
+    indent(out, depth);
+    if text.is_empty() {
+        out.push_str("#\n");
+    } else {
+        out.push_str(&format!("# {text}\n"));
     }
 }
 
@@ -159,6 +206,7 @@ fn effect(out: &mut String, e: &Effect, comments: &mut Comments<'_>) {
             out.push_str(&format!(" label {}", quote(l)));
         }
         out.push('\n');
+        comments.flush_trailing(out);
     });
 
     section(out, &e.channels, |out, c| {
@@ -172,18 +220,21 @@ fn effect(out: &mut String, e: &Effect, comments: &mut Comments<'_>) {
             out.push_str(&format!(" default {}", expr(d)));
         }
         out.push('\n');
+        comments.flush_trailing(out);
     });
 
     section(out, &e.lets, |out, b| {
         comments.flush_before(out, b.span.start, 1);
         indent(out, 1);
         out.push_str(&format!("let {} = {}\n", b.name, expr(&b.value)));
+        comments.flush_trailing(out);
     });
 
     section(out, &e.masks, |out, b| {
         comments.flush_before(out, b.span.start, 1);
         indent(out, 1);
         out.push_str(&format!("mask {} = {}\n", b.name, expr(&b.value)));
+        comments.flush_trailing(out);
     });
 
     section(out, &e.states, |out, s| {
@@ -195,6 +246,7 @@ fn effect(out: &mut String, e: &Effect, comments: &mut Comments<'_>) {
             s.ty.as_str(),
             expr(&s.init)
         ));
+        comments.flush_trailing(out);
     });
 
     for f in &e.fns {
@@ -207,6 +259,7 @@ fn effect(out: &mut String, e: &Effect, comments: &mut Comments<'_>) {
         out.push('\n');
         comments.flush_before(out, l.span.start, 1);
         layer(out, l, comments);
+        comments.flush_trailing(out);
     }
 
     // Anything still inside the braces belongs to this effect, not to whatever
