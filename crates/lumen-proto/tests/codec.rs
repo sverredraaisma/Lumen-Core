@@ -422,13 +422,14 @@ fn a_source_above_the_floor_with_no_expiry_is_refused_on_decode() {
 }
 
 #[test]
-fn priority_one_already_counts_as_above_the_floor() {
-    // The boundary, not just a comfortably-high number.
+fn sixty_four_is_the_first_priority_that_must_expire() {
+    // The boundary, not just a comfortably-high number. The ambient band is
+    // 0-63 and is the floor; 64 is the first thing above it.
     let bad = SrcPush {
         source_id: uuid(1),
         zone_id: uuid(2),
         scene_id: uuid(3),
-        priority: 1,
+        priority: 64,
         fade_in_ms: 0,
         fade_out_ms: 0,
         expires_at: None,
@@ -439,9 +440,28 @@ fn priority_one_already_counts_as_above_the_floor() {
     assert_eq!(
         bad.encode(&mut w),
         Err(EncodeError::Invalid(DecodeError::SourceWithoutExpiry {
-            priority: 1
+            priority: 64
         }))
     );
+}
+
+#[test]
+fn an_ambient_scene_may_be_immortal_anywhere_in_its_band() {
+    // The reason the threshold is 63 rather than 0. An ambient scene at priority
+    // 40 with no expiry is not a bug - it is the floor, and a floor on a timer
+    // is not a floor.
+    for priority in [0u8, 1, 40, AMBIENT_FLOOR_PRIORITY] {
+        assert_round_trips(&Payload::SrcPush(SrcPush {
+            source_id: uuid(1),
+            zone_id: uuid(2),
+            scene_id: uuid(3),
+            priority,
+            fade_in_ms: 0,
+            fade_out_ms: 0,
+            expires_at: None,
+            param_overrides: &[],
+        }));
+    }
 }
 
 // ---- Replicated state ------------------------------------------------------

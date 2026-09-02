@@ -339,10 +339,16 @@ impl<'a> Frame<'a> {
     }
 }
 
-/// The lowest priority at which a source may omit an expiry.
+/// The highest priority that may omit an expiry.
 ///
-/// Anything above this is the ambient floor's superior and must expire.
-pub const AMBIENT_FLOOR_PRIORITY: u8 = 0;
+/// The ambient band is 0–63, and that band **is** the floor: a floor that had to
+/// expire would not be a floor, because something has to hold the lights when
+/// every show, override and alert has gone.
+///
+/// Earlier this was 0, which contradicted the band table in the runtime model
+/// and split the two implementations — this codec refused an ambient scene at
+/// priority 40 that the source stack accepted.
+pub const AMBIENT_FLOOR_PRIORITY: u8 = 63;
 
 /// `SRC_PUSH` — 0x30. Push a source onto a zone's stack.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
