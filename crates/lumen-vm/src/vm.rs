@@ -243,8 +243,15 @@ pub struct Machine {
     repeat_depth: usize,
     calls: [usize; STACK_DEPTH],
     call_depth: usize,
-    /// Colour written by `PREVWRITE`, to be fed back as `prev` next frame.
+    /// Colour to feed back as `prev` next frame.
     prev_out: [Q16; 3],
+    /// Whether this invocation wrote the history explicitly.
+    ///
+    /// Without it the history would only ever advance for a program that used
+    /// `state`, and every trail written against plain `prev` would freeze on its
+    /// first frame - which is what "this pixel's value last frame" plainly does
+    /// not mean.
+    prev_written: bool,
     spent: u32,
     limit: u32,
 }
@@ -264,6 +271,7 @@ impl Machine {
             calls: [0; STACK_DEPTH],
             call_depth: 0,
             prev_out: [Q16::ZERO; 3],
+            prev_written: false,
             spent: 0,
             limit: u32::MAX,
         }
@@ -300,6 +308,7 @@ impl Machine {
         self.repeat_depth = 0;
         self.call_depth = 0;
         self.prev_out = [Q16::ZERO; 3];
+        self.prev_written = false;
     }
 
     fn load_inputs(&mut self, inp: &PixelInputs) {
@@ -317,7 +326,10 @@ impl Machine {
         for k in 0..3 {
             self.regs[R_PREV as usize + k] = inp.prev[k];
         }
+        // Carry last frame's value forward as the default. An emit replaces it;
+        // an explicit PREVWRITE overrides both.
         self.prev_out = inp.prev;
+        self.prev_written = false;
     }
 
     /// Run the `once` section. Call on activation.
@@ -646,6 +658,7 @@ impl Machine {
             }
             PrevWrite => {
                 self.prev_out = self.reg_run::<3>(a)?;
+                self.prev_written = true;
             }
             MaskTest => {
                 // The early-out that makes layered effects affordable: a
@@ -726,14 +739,24 @@ impl Machine {
                 uniforms.probe(ins.bc(), v);
             }
             EmitRgb => {
+                let rgb = [self.reg(a)?, self.reg(b)?, self.reg(c)?];
+                // The history defaults to what was emitted, so `prev` means
+                // "this pixel's colour last frame" for every program, not only
+                // one that declared a `state`. An explicit PREVWRITE still wins.
+                if !self.prev_written {
+                    self.prev_out = rgb;
+                }
                 *out = PixelOutput::Rgb {
-                    r: self.reg(a)?,
-                    g: self.reg(b)?,
-                    b: self.reg(c)?,
+                    r: rgb[0],
+                    g: rgb[1],
+                    b: rgb[2],
                 };
             }
             EmitRgbw => {
                 let [r, g, b2, w] = self.reg_run::<4>(a)?;
+                if !self.prev_written {
+                    self.prev_out = [r, g, b2];
+                }
                 *out = PixelOutput::Rgbw { r, g, b: b2, w };
             }
             EmitCct => {

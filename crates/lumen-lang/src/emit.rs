@@ -64,6 +64,7 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
         r: resolved,
         diags,
         builder: ProgramBuilder::new(),
+        once: Vec::new(),
         frame: Vec::new(),
         pixel: Vec::new(),
         bound: Vec::new(),
@@ -82,11 +83,14 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
     let report = BudgetReport {
         instructions_per_pixel: e.pixel.iter().map(|i| i.op.cost()).sum(),
         instructions_per_frame: e.frame.iter().map(|i| i.op.cost()).sum(),
-        instructions_once: 0,
+        instructions_once: e.once.iter().map(|i| i.op.cost()).sum(),
         registers_used: e.high_water,
     };
 
     let mut builder = e.builder;
+    for ins in &e.once {
+        builder.push(Section::Once, *ins);
+    }
     for ins in &e.frame {
         builder.push(Section::Frame, *ins);
     }
@@ -133,6 +137,10 @@ struct Emitter<'a, 'd> {
     r: &'a Resolved<'a>,
     diags: &'d mut Diagnostics,
     builder: ProgramBuilder,
+    /// The `once` section. Empty today - nothing the language expresses needs
+    /// activation-time work yet - but counted rather than assumed zero, so the
+    /// report stays honest the moment something does.
+    once: Vec<Instruction>,
     frame: Vec<Instruction>,
     pixel: Vec<Instruction>,
     /// Names bound to permanent registers, in declaration order.

@@ -72,7 +72,12 @@ pub struct BudgetReport {
     /// Cost of the `frame` section, paid once per frame however many LEDs there
     /// are. The whole point of hoisting is to move work here.
     pub instructions_per_frame: u32,
-    /// Cost of the `once` section.
+    /// Cost of the `once` section, paid on activation.
+    ///
+    /// Zero for every program the compiler currently produces, because nothing
+    /// the language expresses needs activation-time work. It is measured rather
+    /// than assumed, so a caller can cap it: capping at an assumed zero would
+    /// fault every correct program the moment one did.
     pub instructions_once: u32,
     /// Registers the program needs live at its widest point.
     pub registers_used: u8,

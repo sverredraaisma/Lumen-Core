@@ -1236,3 +1236,134 @@ fn no_arrays_refuses_every_access() {
     assert_eq!(none.load(0, 0), Err(Fault::OutOfBounds));
     assert_eq!(none.store(0, 0, Q16::ONE), Err(Fault::OutOfBounds));
 }
+
+#[test]
+fn the_history_defaults_to_what_was_emitted() {
+    // `prev` means "this pixel's colour last frame". Without this it would only
+    // advance for a program that declared a `state`, and every trail written
+    // against plain `prev` would freeze on its first frame - which is what the
+    // desktop preview hit the moment it fed prev_out back.
+    let bytes = pixel_program(|b| {
+        let k = b.constant(Q16::HALF);
+        b.push(Section::Pixel, Instruction::with_imm(OpCode::LoadK, 20, k));
+        b.push(
+            Section::Pixel,
+            Instruction::new(OpCode::EmitRgb, 20, 20, 20),
+        );
+    });
+    let program = Program::parse(&bytes).unwrap();
+    let mut m = Machine::new();
+    m.run_pixel(&program, &PixelInputs::default(), &mut NoUniforms)
+        .unwrap();
+    assert_eq!(m.prev_out(), [Q16::HALF; 3]);
+}
+
+#[test]
+fn an_explicit_history_write_beats_the_emitted_colour() {
+    // `state` exists so an author can decide what the history holds. If the
+    // emit overwrote it, assigning a state would do nothing.
+    let bytes = pixel_program(|b| {
+        let quarter = b.constant(Q16::from_ratio(1, 4));
+        let one = b.constant(Q16::ONE);
+        b.push(
+            Section::Pixel,
+            Instruction::with_imm(OpCode::LoadK, 20, quarter),
+        );
+        b.push(
+            Section::Pixel,
+            Instruction::with_imm(OpCode::LoadK, 21, quarter),
+        );
+        b.push(
+            Section::Pixel,
+            Instruction::with_imm(OpCode::LoadK, 22, quarter),
+        );
+        b.push(
+            Section::Pixel,
+            Instruction::new(OpCode::PrevWrite, 20, 0, 0),
+        );
+        b.push(
+            Section::Pixel,
+            Instruction::with_imm(OpCode::LoadK, 23, one),
+        );
+        b.push(
+            Section::Pixel,
+            Instruction::new(OpCode::EmitRgb, 23, 23, 23),
+        );
+    });
+    let program = Program::parse(&bytes).unwrap();
+    let mut m = Machine::new();
+    let out = m
+        .run_pixel(&program, &PixelInputs::default(), &mut NoUniforms)
+        .unwrap();
+    assert_eq!(
+        out,
+        PixelOutput::Rgb {
+            r: Q16::ONE,
+            g: Q16::ONE,
+            b: Q16::ONE
+        }
+    );
+    assert_eq!(m.prev_out(), [Q16::from_ratio(1, 4); 3]);
+}
+
+#[test]
+fn a_pixel_that_emits_nothing_carries_its_history_forward() {
+    // A masked-off pixel emits nothing and must not lose what it was holding,
+    // or a trail would be erased wherever a mask happened to gate it.
+    let bytes = pixel_program(|b| {
+        b.push(Section::Pixel, Instruction::new(OpCode::Nop, 0, 0, 0));
+    });
+    let program = Program::parse(&bytes).unwrap();
+    let mut m = Machine::new();
+    let held = [Q16::HALF, Q16::ZERO, Q16::ONE];
+    m.run_pixel(
+        &program,
+        &PixelInputs {
+            prev: held,
+            ..Default::default()
+        },
+        &mut NoUniforms,
+    )
+    .unwrap();
+    assert_eq!(m.prev_out(), held);
+}
+
+#[test]
+fn a_trail_decays_over_frames_with_no_state_declared() {
+    // The end-to-end shape: read prev, halve it, emit. The history has to
+    // advance on its own for this to converge on black.
+    let bytes = pixel_program(|b| {
+        let half = b.constant(Q16::HALF);
+        b.push(Section::Pixel, Instruction::new(OpCode::PrevRead, 20, 0, 0));
+        b.push(
+            Section::Pixel,
+            Instruction::with_imm(OpCode::LoadK, 23, half),
+        );
+        b.push(Section::Pixel, Instruction::new(OpCode::Mul, 20, 20, 23));
+        b.push(
+            Section::Pixel,
+            Instruction::new(OpCode::EmitRgb, 20, 21, 22),
+        );
+    });
+    let program = Program::parse(&bytes).unwrap();
+    let mut m = Machine::new();
+    let mut prev = [Q16::ONE, Q16::ZERO, Q16::ZERO];
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        m.run_pixel(
+            &program,
+            &PixelInputs {
+                prev,
+                ..Default::default()
+            },
+            &mut NoUniforms,
+        )
+        .unwrap();
+        prev = m.prev_out();
+        seen.push(prev[0]);
+    }
+    assert_eq!(seen[0], Q16::HALF);
+    for pair in seen.windows(2) {
+        assert!(pair[1] < pair[0], "the trail stopped decaying: {seen:?}");
+    }
+}
