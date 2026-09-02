@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lumen-proto",
+    "crates/lumen-vm",
+    "crates/lumen-lang",
+    "crates/lumen-hal",
+    "crates/lumen-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/REPLACE-ME/lumen-core"
+rust-version = "1.85"
+authors = ["The Lumen contributors"]
+
+[workspace.dependencies]
+lumen-proto = { version = "0.1.0", path = "crates/lumen-proto" }
+lumen-vm    = { version = "0.1.0", path = "crates/lumen-vm" }
+lumen-lang  = { version = "0.1.0", path = "crates/lumen-lang" }
+lumen-hal   = { version = "0.1.0", path = "crates/lumen-hal" }

@@ -1,0 +1,11 @@
+[package]
+name = "lumen-hal"
+description = "Hardware abstraction traits for Lumen: clock, network, storage, LED output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]

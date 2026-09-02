@@ -1,0 +1,11 @@
+[package]
+name = "lumen-vm"
+description = "Lumen bytecode VM: pixel and sim profiles, Q16.16 fixed point, allocation-free"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]

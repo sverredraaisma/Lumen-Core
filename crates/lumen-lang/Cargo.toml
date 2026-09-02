@@ -1,0 +1,12 @@
+[package]
+name = "lumen-lang"
+description = "Lumen effect-language compiler: parser, resolver, partitioner, emitter, formatter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+lumen-vm = { workspace = true }
