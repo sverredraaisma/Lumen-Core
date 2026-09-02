@@ -17,9 +17,12 @@
 //! header alone** — `show_time_us` says whether it is already late, and
 //! `mesh_prefix` says whether it belongs to this mesh at all.
 //!
-//! Cryptography is not here. The AEAD tag is carried as opaque bytes and
-//! verified by the layer that holds the mesh key (W14); this crate's job is to
-//! say exactly which bytes are covered.
+//! Cryptography is not here, but its *shape* is: [`crypto`] defines which bytes
+//! are authenticated, in what order, and with what nonce, and leaves the
+//! algorithms to whoever links the crate. That keeps this crate
+//! dependency-free - it runs on an ESP32-C3, in a phone and on a desktop, and
+//! the right cipher implementation differs for each - while putting the part
+//! that is easy to get subtly wrong in one testable place.
 //!
 //! # Rules that decoding enforces
 //!
@@ -36,12 +39,14 @@
 #![forbid(unsafe_code)]
 
 pub mod buf;
+pub mod crypto;
 pub mod error;
 pub mod header;
 pub mod msg;
 pub mod replay;
 
 pub use buf::{Reader, Writer};
+pub use crypto::{Aead, Signer, Verifier};
 pub use error::{DecodeError, EncodeError};
 pub use header::{
     Flags, Header, MsgType, HEADER_LEN, MAGIC, OVERHEAD, TAG_LEN, VERSION_MAJOR, VERSION_MINOR,

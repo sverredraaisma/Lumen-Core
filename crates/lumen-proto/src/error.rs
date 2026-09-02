@@ -26,6 +26,12 @@ pub enum DecodeError {
     BadUtf8,
     /// A field held a value outside its defined range.
     InvalidValue { field: &'static str },
+    /// The AEAD tag did not verify.
+    ///
+    /// Deliberately carries nothing about *why*. There is one useful response -
+    /// drop the datagram - and any detail here would be a signal to whoever sent
+    /// it about how close they got.
+    BadTag,
     /// A `SRC_PUSH` above the ambient floor carried no expiry.
     ///
     /// The "stuck red at 3am" rule, enforced at the wire level so that no client
