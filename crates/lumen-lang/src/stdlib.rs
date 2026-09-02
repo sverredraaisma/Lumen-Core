@@ -88,7 +88,7 @@ pub fn load(version: StdlibVersion, diags: &mut Diagnostics) -> Option<Stdlib> {
             ));
             return None;
         }
-        let Some(file) = file else { return None };
+        let file = file?;
         for d in file.decls {
             match d {
                 Decl::Fn(f) => out.fns.push(f),
