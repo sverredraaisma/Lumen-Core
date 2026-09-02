@@ -8,4 +8,11 @@ repository.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 
+[features]
+# `builder` is on by default because the compiler, the simulator and every test
+# need it. It pulls in `alloc`, so firmware builds turn it off:
+#     lumen-vm = { version = "0.1", default-features = false }
+default = ["builder"]
+builder = []
+
 [dependencies]
