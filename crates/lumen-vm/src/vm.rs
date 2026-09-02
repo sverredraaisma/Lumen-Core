@@ -44,14 +44,18 @@ pub const R_UV_X: u8 = 9;
 pub const R_UV_Y: u8 = 10;
 /// Show time in seconds.
 pub const R_T: u8 = 11;
-/// This pixel's value last frame — the local history buffer.
+/// This pixel's colour last frame — the local history buffer.
+///
+/// Three registers, `R_PREV..R_PREV+2`, because the language types `prev` as a
+/// `color`. A single-component history would make trails and fire monochrome,
+/// which is most of what the history buffer exists for.
 pub const R_PREV: u8 = 12;
 
 /// First register not overwritten per pixel.
 ///
 /// Everything from here up survives from `frame` into every pixel, which is what
 /// makes hoisting pay.
-pub const R_SCRATCH: u8 = 13;
+pub const R_SCRATCH: u8 = 15;
 
 /// How deep `REPEAT` blocks and `CALL`s may nest.
 ///
@@ -78,8 +82,8 @@ pub struct PixelInputs {
     pub u: Q16,
     pub uv_x: Q16,
     pub uv_y: Q16,
-    /// This pixel's value last frame.
-    pub prev: Q16,
+    /// This pixel's colour last frame.
+    pub prev: [Q16; 3],
 }
 
 /// What a `pixel` section emitted.
@@ -239,8 +243,8 @@ pub struct Machine {
     repeat_depth: usize,
     calls: [usize; STACK_DEPTH],
     call_depth: usize,
-    /// Value written by `PREVWRITE`, to be fed back as `prev` next frame.
-    prev_out: Q16,
+    /// Colour written by `PREVWRITE`, to be fed back as `prev` next frame.
+    prev_out: [Q16; 3],
     spent: u32,
     limit: u32,
 }
@@ -259,7 +263,7 @@ impl Machine {
             repeat_depth: 0,
             calls: [0; STACK_DEPTH],
             call_depth: 0,
-            prev_out: Q16::ZERO,
+            prev_out: [Q16::ZERO; 3],
             spent: 0,
             limit: u32::MAX,
         }
@@ -285,8 +289,8 @@ impl Machine {
         Ok(())
     }
 
-    /// The value `PREVWRITE` left, to be fed back as `prev` next frame.
-    pub fn prev_out(&self) -> Q16 {
+    /// The colour `PREVWRITE` left, to be fed back as `prev` next frame.
+    pub fn prev_out(&self) -> [Q16; 3] {
         self.prev_out
     }
 
@@ -295,7 +299,7 @@ impl Machine {
         self.regs = [Q16::ZERO; REG_COUNT];
         self.repeat_depth = 0;
         self.call_depth = 0;
-        self.prev_out = Q16::ZERO;
+        self.prev_out = [Q16::ZERO; 3];
     }
 
     fn load_inputs(&mut self, inp: &PixelInputs) {
@@ -310,7 +314,9 @@ impl Machine {
         self.regs[R_U as usize] = inp.u;
         self.regs[R_UV_X as usize] = inp.uv_x;
         self.regs[R_UV_Y as usize] = inp.uv_y;
-        self.regs[R_PREV as usize] = inp.prev;
+        for k in 0..3 {
+            self.regs[R_PREV as usize + k] = inp.prev[k];
+        }
         self.prev_out = inp.prev;
     }
 
@@ -631,11 +637,15 @@ impl Machine {
                 self.put(a, v)?;
             }
             PrevRead => {
-                let v = self.regs[R_PREV as usize];
-                self.put(a, v)?;
+                let v = [
+                    self.regs[R_PREV as usize],
+                    self.regs[R_PREV as usize + 1],
+                    self.regs[R_PREV as usize + 2],
+                ];
+                self.put_run::<3>(a, v)?;
             }
             PrevWrite => {
-                self.prev_out = self.reg(a)?;
+                self.prev_out = self.reg_run::<3>(a)?;
             }
             MaskTest => {
                 // The early-out that makes layered effects affordable: a

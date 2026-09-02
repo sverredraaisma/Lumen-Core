@@ -334,6 +334,36 @@ impl Emitter<'_, '_> {
             self.bound.push((b.name.clone(), dst));
         }
 
+        // Assigning a `state` inside a layer writes the per-pixel history
+        // buffer, which is what makes trails and fire possible at all.
+        for a in &layer.assigns {
+            if a.target == "color" {
+                continue;
+            }
+            let is_state = self.r.effect.states.iter().any(|st| st.name == a.target);
+            if !is_state {
+                continue;
+            }
+            self.next_temp = self.temp_floor;
+            let Some(v) = self.expr(Rate::Pixel, &a.value) else {
+                return;
+            };
+            // Write straight into the history registers rather than through
+            // scratch. Two reasons: it costs three registers less on the
+            // hottest path, and a later read of the state in the same frame
+            // then sees the value just assigned, which is what an author who
+            // writes `trail = ...` and then `color = trail` expects.
+            for k in (0..3).rev() {
+                let src = v.at(k);
+                if R_PREV + k != src {
+                    self.pixel
+                        .push(Instruction::new(OpCode::Mov, R_PREV + k, src, 0));
+                }
+            }
+            self.pixel
+                .push(Instruction::new(OpCode::PrevWrite, R_PREV, 0, 0));
+        }
+
         let color_assign = layer.assigns.iter().find(|a| a.target == "color");
         let Some(assign) = color_assign else {
             return;
@@ -565,9 +595,11 @@ impl Emitter<'_, '_> {
                     base: R_UV_X,
                     width: 2,
                 },
+                // `prev` is a colour, so three registers, matching the type
+                // the grammar gives it.
                 "prev" => Val {
                     base: R_PREV,
-                    width: 1,
+                    width: 3,
                 },
                 _ => {
                     // `mapq` has no register yet; zero is the honest answer for
@@ -583,6 +615,10 @@ impl Emitter<'_, '_> {
         // activations, never within one.
         let sym = self.r.symbols.get(name)?;
         match sym.kind {
+            SymbolKind::State => Some(Val {
+                base: R_PREV,
+                width: 3,
+            }),
             SymbolKind::Param => {
                 let p = &self.r.effect.params[sym.index];
                 let width = p.ty.width() as u8;
@@ -715,6 +751,47 @@ impl Emitter<'_, '_> {
         out
     }
 
+    /// Whether a destination at `base..base+width` can be written without
+    /// destroying a source that has still to be read.
+    ///
+    /// A source is safe when it sits below the temporary floor (a builtin or a
+    /// hoisted binding, which the destination can never occupy) or outside the
+    /// destination range entirely. Anything else has to be copied somewhere
+    /// fresh instead.
+    ///
+    /// This is checked rather than assumed. The tempting invariant - "component
+    /// `k` was allocated at most at `mark + k`" - holds for a flat expression
+    /// and breaks the moment an inlined function leaves its result higher up,
+    /// which is exactly the case that produced silently wrong output.
+    fn collapse_is_safe(&self, base: u8, width: u8, sources: &[Val]) -> bool {
+        sources.iter().enumerate().all(|(k, v)| {
+            let src = v.base;
+            src < self.temp_floor || src == base + k as u8 || src >= base + width
+        })
+    }
+
+    /// Gather values into a contiguous run, reusing their scratch when it is
+    /// safe to do so.
+    ///
+    /// Moves run descending, so a source further up the range is read before
+    /// anything below it is overwritten.
+    fn pack(&mut self, rate: Rate, mark: u8, vals: &[Val]) -> Option<Val> {
+        let width = vals.len() as u8;
+        let dst = if self.collapse_is_safe(mark, width, vals) {
+            self.release_to(mark);
+            self.temp(width)?
+        } else {
+            self.temp(width)?
+        };
+        for k in (0..width).rev() {
+            let src = vals[k as usize].base;
+            if dst.base + k != src {
+                self.push(rate, Instruction::new(OpCode::Mov, dst.base + k, src, 0));
+            }
+        }
+        Some(dst)
+    }
+
     fn call(&mut self, rate: Rate, callee: &str, args: &[Expr], e: &Expr) -> Option<Val> {
         // `palette` takes a palette name, not a value, so it cannot go through
         // the ordinary argument path.
@@ -728,7 +805,14 @@ impl Emitter<'_, '_> {
                 return None;
             };
             let idx = self.r.palettes.iter().position(|p| &p.name == pname)?;
+            let mark = self.next_temp;
             let pos = self.expr(rate, &args[1])?;
+            // PALETTE reads its position before writing the three components,
+            // so the result may start exactly on top of the register that held
+            // it - but not one or two above, which would clobber it mid-write.
+            if self.collapse_is_safe(mark, 3, &[pos]) {
+                self.release_to(mark);
+            }
             let dst = self.temp(3)?;
             self.push(
                 rate,
@@ -753,32 +837,20 @@ impl Emitter<'_, '_> {
         // Constructors are register moves.
         match callee {
             "vec2" | "vec3" | "rgb" => {
-                let width = vals.len() as u8;
-                let dst = self.temp(width)?;
-                for (k, v) in vals.iter().enumerate() {
-                    self.push(
-                        rate,
-                        Instruction::new(OpCode::Mov, dst.base + k as u8, v.base, 0),
-                    );
-                }
-                return Some(dst);
+                return self.pack(rate, mark, &vals);
             }
             "hsv" => {
-                let packed = self.temp(3)?;
-                for (k, v) in vals.iter().enumerate() {
-                    self.push(
-                        rate,
-                        Instruction::new(OpCode::Mov, packed.base + k as u8, v.base, 0),
-                    );
-                }
-                let dst = self.temp(3)?;
+                let packed = self.pack(rate, mark, &vals)?;
+                // HSV2RGB reads three registers and writes three; in place is
+                // fine because the VM reads the whole source before writing.
                 self.push(
                     rate,
-                    Instruction::new(OpCode::Hsv2Rgb, dst.base, packed.base, 0),
+                    Instruction::new(OpCode::Hsv2Rgb, packed.base, packed.base, 0),
                 );
-                return Some(dst);
+                return Some(packed);
             }
             "temp" => {
+                self.release_to(mark);
                 let dst = self.temp(3)?;
                 self.push(
                     rate,
@@ -794,14 +866,10 @@ impl Emitter<'_, '_> {
                 return Some(dst);
             }
             "noise3" => {
-                // NOISE3 reads three consecutive registers, so pack first.
-                let packed = self.temp(3)?;
-                for (k, v) in vals.iter().enumerate() {
-                    self.push(
-                        rate,
-                        Instruction::new(OpCode::Mov, packed.base + k as u8, v.base, 0),
-                    );
-                }
+                // NOISE3 reads three consecutive registers, so pack first. The
+                // scalar result then reuses the first of them.
+                let packed = self.pack(rate, mark, &vals)?;
+                self.release_to(mark);
                 let dst = self.temp(1)?;
                 self.push(
                     rate,

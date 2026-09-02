@@ -777,16 +777,17 @@ fn a_channel_with_no_publisher_reads_zero_rather_than_failing() {
 
 #[test]
 fn the_history_buffer_round_trips_through_a_frame() {
-    // Trails and fire are built on this: read last frame's value, write this
-    // one's.
+    // Trails and fire are built on this: read last frame's colour, write this
+    // one's. It is a colour, not a scalar - a monochrome history would make
+    // every trail grey, which is most of what the buffer exists for.
     let bytes = pixel_program(|b| {
         let half = b.constant(Q16::HALF);
         b.push(Section::Pixel, Instruction::new(OpCode::PrevRead, 20, 0, 0));
         b.push(
             Section::Pixel,
-            Instruction::with_imm(OpCode::LoadK, 21, half),
+            Instruction::with_imm(OpCode::LoadK, 23, half),
         );
-        b.push(Section::Pixel, Instruction::new(OpCode::Add, 20, 20, 21));
+        b.push(Section::Pixel, Instruction::new(OpCode::Add, 20, 20, 23));
         b.push(
             Section::Pixel,
             Instruction::new(OpCode::PrevWrite, 20, 0, 0),
@@ -795,7 +796,7 @@ fn the_history_buffer_round_trips_through_a_frame() {
     let program = Program::parse(&bytes).unwrap();
     let mut m = Machine::new();
 
-    let mut prev = Q16::ZERO;
+    let mut prev = [Q16::ZERO; 3];
     for expect in 1..=4 {
         let inputs = PixelInputs {
             prev,
@@ -803,8 +804,36 @@ fn the_history_buffer_round_trips_through_a_frame() {
         };
         m.run_pixel(&program, &inputs, &mut NoUniforms).unwrap();
         prev = m.prev_out();
-        assert_eq!(prev, Q16::from_ratio(expect, 2));
+        // Only the red channel accumulates; the other two ride along untouched,
+        // which proves all three are carried rather than one being broadcast.
+        assert_eq!(prev[0], Q16::from_ratio(expect, 2));
+        assert_eq!(prev[1], Q16::ZERO);
+        assert_eq!(prev[2], Q16::ZERO);
     }
+}
+
+#[test]
+fn every_channel_of_the_history_buffer_is_carried() {
+    let bytes = pixel_program(|b| {
+        b.push(Section::Pixel, Instruction::new(OpCode::PrevRead, 20, 0, 0));
+        b.push(
+            Section::Pixel,
+            Instruction::new(OpCode::PrevWrite, 20, 0, 0),
+        );
+    });
+    let program = Program::parse(&bytes).unwrap();
+    let mut m = Machine::new();
+    let colour = [Q16::from_ratio(1, 4), Q16::HALF, Q16::from_ratio(3, 4)];
+    m.run_pixel(
+        &program,
+        &PixelInputs {
+            prev: colour,
+            ..Default::default()
+        },
+        &mut NoUniforms,
+    )
+    .unwrap();
+    assert_eq!(m.prev_out(), colour);
 }
 
 #[test]

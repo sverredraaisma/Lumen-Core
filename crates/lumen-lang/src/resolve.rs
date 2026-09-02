@@ -322,6 +322,8 @@ pub fn core_fn(name: &str) -> Option<&'static Signature> {
 #[derive(Clone, PartialEq, Debug)]
 pub enum SymbolKind {
     Param,
+    /// The per-pixel history buffer.
+    State,
     Channel,
     Let,
     Mask,
@@ -525,6 +527,21 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
         );
     }
 
+    // States are readable everywhere a `let` is, at pixel rate: the value is
+    // this pixel's colour from the previous frame.
+    for (index, st) in effect.states.iter().enumerate() {
+        r.declare(
+            &st.name,
+            Symbol {
+                kind: SymbolKind::State,
+                ty: Type::Color,
+                rate: Rate::Pixel,
+                span: st.span,
+                index,
+            },
+        );
+    }
+
     // `let` and `mask` in declaration order, each seeing what came before.
     let mut lets = Vec::new();
     for (index, b) in effect.lets.iter().enumerate() {
@@ -636,12 +653,27 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
 
     // Constructs the compiler parses but cannot yet emit. Refusing loudly beats
     // compiling something that silently does less than the author wrote.
-    for s in &effect.states {
-        r.diags.push(Diagnostic::error(
-            s.span,
-            "`state` is not implemented yet",
-            "the history buffer is reachable through `prev` in the meantime",
-        ));
+    // `state` maps onto the VM's per-pixel history buffer, of which there is
+    // exactly one. More than one declaration cannot be honoured, and quietly
+    // aliasing them would produce an effect that looks nearly right and is not.
+    if effect.states.len() > 1 {
+        for extra in &effect.states[1..] {
+            r.diags.push(Diagnostic::error(
+                extra.span,
+                "an effect may declare only one `state`",
+                "the device keeps one history buffer per pixel; combine the values into a single `color` state",
+            ));
+        }
+    }
+    for st in &effect.states {
+        if st.ty != Type::Color {
+            r.diags.push(Diagnostic::error(
+                st.span,
+                alloc::format!("`state` must be a `color`, not `{}`", st.ty.as_str()),
+                "the per-pixel history buffer holds a colour; use `rgb(...)` for the initial value",
+            ));
+        }
+        let (_, _) = r.check(&st.init);
     }
     for s in &effect.sims {
         r.diags.push(Diagnostic::error(

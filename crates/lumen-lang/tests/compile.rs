@@ -533,7 +533,15 @@ fn unimplemented_constructs_are_refused_loudly_rather_than_ignored() {
     // Compiling something that silently does less than the author wrote is the
     // one outcome worse than refusing.
     let es = errors(
-        "lumen 1\neffect \"x\" {\n  state s : float = 0\n  layer b { color = rgb(0,0,0) }\n}\n",
+        r#"
+lumen 1
+effect "x" {
+  sim particles(count = 8) {
+    a = 1
+  }
+  layer b { color = rgb(0,0,0) }
+}
+"#,
     );
     assert!(es.iter().any(|e| e.contains("not implemented")), "{es:?}");
 }
@@ -951,5 +959,111 @@ effect "b" {
         "argument was evaluated more than once: {} vs {}",
         once.instructions_per_pixel,
         thrice.instructions_per_pixel
+    );
+}
+
+// ---- Per-pixel history -----------------------------------------------------
+
+#[test]
+fn a_state_reads_last_frames_colour_and_writes_this_frames() {
+    // A decay trail: the classic use of the history buffer, and the reason it
+    // exists. Each frame keeps half of what was there and adds a new impulse.
+    let src = r#"
+lumen 1
+effect "trail" {
+  state trail : color = rgb(0, 0, 0)
+  layer base {
+    let faded = trail * 0.5
+    trail = faded + rgb(0.5, 0, 0)
+    color = trail
+  }
+}
+"#;
+    let (bytes, _) = build(src);
+    let program = Program::parse(&bytes).unwrap();
+    let mut m = Machine::new();
+
+    // Feeding the previous frame's output back is what the render loop does.
+    let mut prev = [Q16::ZERO; 3];
+    let mut reds = Vec::new();
+    for _ in 0..4 {
+        let inputs = PixelInputs {
+            prev,
+            ..Default::default()
+        };
+        m.run_pixel(&program, &inputs, &mut NoUniforms).unwrap();
+        prev = m.prev_out();
+        reds.push(prev[0]);
+    }
+    // 0.5, 0.75, 0.875, 0.9375 - decaying toward one.
+    assert_eq!(reds[0], Q16::HALF);
+    assert!(reds[1] > reds[0]);
+    assert!(reds[2] > reds[1]);
+    assert!(reds[3] < Q16::ONE);
+    // And the untouched channels stay dark rather than following red.
+    assert_eq!(prev[1], Q16::ZERO);
+}
+
+#[test]
+fn a_second_state_is_refused_because_there_is_only_one_history_buffer() {
+    // Quietly aliasing two states onto one buffer would produce an effect that
+    // looks nearly right and is not.
+    let es = errors(
+        r#"
+lumen 1
+effect "x" {
+  state a : color = rgb(0,0,0)
+  state b : color = rgb(0,0,0)
+  layer l { color = rgb(0,0,0) }
+}
+"#,
+    );
+    assert!(es.iter().any(|e| e.contains("only one `state`")), "{es:?}");
+}
+
+#[test]
+fn a_non_colour_state_is_refused() {
+    let es = errors(
+        "lumen 1
+effect \"x\" {
+  state s : float = 0
+  layer l { color = rgb(0,0,0) }
+}
+",
+    );
+    assert!(es.iter().any(|e| e.contains("must be a `color`")), "{es:?}");
+}
+
+#[test]
+fn prev_is_a_colour_with_three_channels() {
+    let src = r#"
+lumen 1
+effect "echo" {
+  layer base {
+    color = prev
+  }
+}
+"#;
+    let (bytes, _) = build(src);
+    let program = Program::parse(&bytes).unwrap();
+    let mut m = Machine::new();
+    let colour = [Q16::from_ratio(1, 4), Q16::HALF, Q16::from_ratio(3, 4)];
+    let out = m
+        .run_pixel(
+            &program,
+            &PixelInputs {
+                prev: colour,
+                ..Default::default()
+            },
+            &mut NoUniforms,
+        )
+        .unwrap();
+    assert_eq!(
+        out,
+        PixelOutput::Rgb {
+            r: colour[0],
+            g: colour[1],
+            b: colour[2]
+        }
     );
 }
