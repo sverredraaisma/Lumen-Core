@@ -1175,3 +1175,126 @@ fn the_stdlib_version_reaches_the_graph_hash() {
     // silently change every unversioned effect.
     assert_eq!(a, b);
 }
+
+// ---- Argument order and register economy -----------------------------------
+
+#[test]
+fn step_and_smoothstep_follow_glsl_argument_order() {
+    // Anyone reaching for these has written a shader before. A reversed
+    // interpolation renders wrong rather than failing, so the order has to match
+    // what they will type without thinking.
+    let src = r#"
+lumen 1
+effect "order" {
+  layer base {
+    let a = step(0.5, u)
+    let b = smoothstep(0, 1, u)
+    color = rgb(a, b, 0)
+  }
+}
+"#;
+    let at = |u: i32| {
+        render(
+            src,
+            PixelInputs {
+                u: Q16::from_ratio(u, 4),
+                ..Default::default()
+            },
+            Q16::ZERO,
+        )
+    };
+    // step(0.5, x): 0 below the edge, 1 at or above it.
+    match at(1) {
+        PixelOutput::Rgb { r, .. } => assert_eq!(r, Q16::ZERO, "step below the edge"),
+        other => panic!("{other:?}"),
+    }
+    match at(3) {
+        PixelOutput::Rgb { r, .. } => assert_eq!(r, Q16::ONE, "step above the edge"),
+        other => panic!("{other:?}"),
+    }
+    // smoothstep(0, 1, x) rises with x; reversed arguments would fall.
+    let (lo, hi) = (at(1), at(3));
+    match (lo, hi) {
+        (PixelOutput::Rgb { g: a, .. }, PixelOutput::Rgb { g: b, .. }) => {
+            assert!(b > a, "smoothstep must rise with its value argument");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_binding_nobody_reads_costs_no_register() {
+    // Registers, not instructions, are the binding constraint: 32 of them, and a
+    // hoisted binding holds one until the frame ends. An effect should not pay
+    // for a value it never uses.
+    let with_dead = build(
+        r#"
+lumen 1
+effect "dead" {
+  let unused_a = sin01(t)
+  let unused_b = sin01(t * 2)
+  let unused_c = sin01(t * 3)
+  layer base { color = rgb(1, 0, 0) }
+}
+"#,
+    )
+    .1;
+    let without = build(SOLID).1;
+    assert_eq!(
+        with_dead.registers_used, without.registers_used,
+        "unread bindings still took registers"
+    );
+    assert_eq!(with_dead.instructions_per_frame, 0);
+}
+
+#[test]
+fn an_unread_binding_is_a_warning() {
+    let ws = warnings(
+        r#"
+lumen 1
+effect "dead" {
+  let unused = sin01(t)
+  layer base { color = rgb(1, 0, 0) }
+}
+"#,
+    );
+    assert!(
+        ws.iter().any(|w| w.contains("`unused` is never read")),
+        "{ws:?}"
+    );
+}
+
+#[test]
+fn a_binding_read_only_by_another_binding_still_counts_as_used() {
+    // The chain case: `a` is read by `b`, and `b` by the layer. Neither may be
+    // dropped, and neither may be warned about.
+    let src = r#"
+lumen 1
+effect "chain" {
+  let a = sin01(t)
+  let b = a * 0.5
+  layer base { color = rgb(b, b, b) }
+}
+"#;
+    assert!(warnings(src).is_empty(), "{:?}", warnings(src));
+    let (_, report) = build(src);
+    assert!(report.instructions_per_frame > 0);
+}
+
+#[test]
+fn a_binding_read_only_by_a_mask_counts_as_used() {
+    let src = r#"
+lumen 1
+effect "masked" {
+  let threshold = 0.5
+  mask upper = z > threshold
+  layer base { color = rgb(0, 0, 0) }
+  layer top mask(upper) blend add { color = rgb(1, 1, 1) }
+}
+"#;
+    assert!(
+        !warnings(src).iter().any(|w| w.contains("threshold")),
+        "{:?}",
+        warnings(src)
+    );
+}

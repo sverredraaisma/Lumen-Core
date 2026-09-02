@@ -349,6 +349,10 @@ pub struct ResolvedLet {
     pub ty: Type,
     pub rate: Rate,
     pub index: usize,
+    /// Whether anything reads it. An unread binding is left out of the program
+    /// entirely: it would otherwise hold one of the VM's 32 registers for the
+    /// whole frame while contributing nothing.
+    pub used: bool,
 }
 
 /// An effect that type-checks.
@@ -411,6 +415,7 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
         symbols: BTreeMap::new(),
         has_grid: effect.requires.contains(&Cap::Grid),
         read: alloc::collections::BTreeSet::new(),
+        used: alloc::collections::BTreeSet::new(),
         fns: effect.fns.clone(),
     };
 
@@ -543,7 +548,7 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
     }
 
     // `let` and `mask` in declaration order, each seeing what came before.
-    let mut lets = Vec::new();
+    let mut lets: Vec<ResolvedLet> = Vec::new();
     for (index, b) in effect.lets.iter().enumerate() {
         let (ty, rate) = r.check(&b.value);
         r.declare(
@@ -561,6 +566,9 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
             ty,
             rate,
             index,
+            // Filled in below, once everything that could read it has been
+            // checked.
+            used: false,
         });
         if rate == Rate::Pixel {
             if let Some(reason) = r.why_pixel(&b.value) {
@@ -683,6 +691,22 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
         ));
     }
 
+    // Usage is only known once masks, layers and later bindings have all been
+    // checked, so this is settled here rather than at the declaration.
+    for l in &mut lets {
+        l.used = r.used.contains(&l.name);
+    }
+    for l in &lets {
+        if !l.used {
+            let span = effect.lets[l.index].span;
+            r.diags.push(Diagnostic::warning(
+                span,
+                alloc::format!("`{}` is never read", l.name),
+                "remove it - registers are the scarce resource on this VM, and a hoisted binding holds one for the whole frame",
+            ));
+        }
+    }
+
     // A channel declared but never read is almost always a leftover.
     for c in &effect.channels {
         if !r.read.contains(&c.name) {
@@ -736,6 +760,11 @@ struct Resolver<'d> {
     has_grid: bool,
     /// Channels actually read, so an unread one can be reported.
     read: alloc::collections::BTreeSet<String>,
+    /// Every name an expression referenced, so a binding nobody reads can be
+    /// left out of the program rather than holding a register for the whole
+    /// frame. Registers, not instructions, are the binding constraint on this
+    /// VM - 32 of them, and a hoisted binding holds one until the frame ends.
+    used: alloc::collections::BTreeSet<String>,
     /// The effect's functions, for arity checking at the call site.
     fns: Vec<FnDecl>,
 }
@@ -785,6 +814,7 @@ impl Resolver<'_> {
                         if s.kind == SymbolKind::Channel {
                             self.read.insert(name.clone());
                         }
+                        self.used.insert(name.clone());
                         out
                     }
                     None => {

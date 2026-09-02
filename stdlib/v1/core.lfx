@@ -29,11 +29,11 @@ fn sawtooth(phase : float) -> float {
 }
 
 fn square(phase : float) -> float {
-  return step(fract(phase), 0.5)
+  return step(0.5, fract(phase))
 }
 
 fn pulse(phase : float, width : float) -> float {
-  return 1 - step(fract(phase), width)
+  return 1 - step(width, fract(phase))
 }
 
 fn ping_pong(phase : float) -> float {
@@ -52,10 +52,14 @@ fn ease_out(t : float) -> float {
 }
 
 fn ease_in_out(t : float) -> float {
-  return smoothstep(t, 0, 1)
+  return smoothstep(0, 1, t)
 }
 
 # ---- Utility ----------------------------------------------------------------
+# Argument order follows GLSL throughout: step(edge, x), smoothstep(e0, e1, x),
+# mix(a, b, t), clamp(x, lo, hi). Anyone reaching for these has written a shader
+# before, and a silently reversed interpolation renders wrong rather than
+# failing.
 
 fn remap(v : float, in_lo : float, in_hi : float, out_lo : float) -> float {
   let span = in_hi - in_lo
@@ -74,7 +78,7 @@ fn quantize(v : float, steps : float) -> float {
 }
 
 fn deadzone(v : float, threshold : float) -> float {
-  return v * step(abs(v), threshold)
+  return v * step(threshold, abs(v))
 }
 
 # ---- Shapes -----------------------------------------------------------------

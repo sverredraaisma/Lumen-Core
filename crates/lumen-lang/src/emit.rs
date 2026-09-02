@@ -179,7 +179,7 @@ impl Emitter<'_, '_> {
     /// pulled out into a `let` to avoid repeating.
     fn emit_pixel_lets(&mut self) {
         for l in &self.r.lets {
-            if l.rate != Rate::Pixel {
+            if l.rate != Rate::Pixel || !l.used {
                 continue;
             }
             let width = l.ty.width() as u8;
@@ -270,7 +270,7 @@ impl Emitter<'_, '_> {
     fn emit_frame_lets(&mut self) {
         // Declaration order, so the bytecode is deterministic.
         for l in &self.r.lets {
-            if l.rate == Rate::Pixel {
+            if l.rate == Rate::Pixel || !l.used {
                 continue;
             }
             let width = l.ty.width() as u8;
@@ -897,8 +897,15 @@ impl Emitter<'_, '_> {
 
         // The straightforward one-instruction cases. Each reads its sources and
         // writes its destination, so reusing the argument scratch is safe as
-        // long as every argument is a scalar.
-        if vals.iter().all(|v| v.width == 1) {
+        // long as every argument is a scalar AND the destination lands on the
+        // argument that gets moved into it first.
+        //
+        // `smoothstep` is the exception: it follows GLSL, so its value is the
+        // last argument while the destination would land on the first. Reusing
+        // there overwrites `e0` before the instruction reads it - which showed
+        // up as smoothstep falling instead of rising.
+        let reuses_scratch = vals.iter().all(|v| v.width == 1) && callee != "smoothstep";
+        if reuses_scratch {
             self.release_to(mark);
         }
         let dst = self.temp(1)?;
@@ -917,25 +924,34 @@ impl Emitter<'_, '_> {
             "atan2" => Instruction::new(OpCode::Atan2, dst.base, vals[0].base, vals[1].base),
             "min" => Instruction::new(OpCode::Min, dst.base, vals[0].base, vals[1].base),
             "max" => Instruction::new(OpCode::Max, dst.base, vals[0].base, vals[1].base),
-            "step" => Instruction::new(OpCode::Step, dst.base, vals[0].base, vals[1].base),
+            // GLSL order: step(edge, x). The VM instruction takes the value
+            // first, so the operands swap here rather than in the ISA - the
+            // instruction set is frozen, the surface syntax is not.
+            "step" => Instruction::new(OpCode::Step, dst.base, vals[1].base, vals[0].base),
             "noise1" => Instruction::new(OpCode::Noise1, dst.base, vals[0].base, 0),
             "noise2" => Instruction::new(OpCode::Noise2, dst.base, vals[0].base, vals[1].base),
             "length" => Instruction::new(OpCode::Len2, dst.base, vals[0].base, vals[1].base),
             "dot" => Instruction::new(OpCode::Mul, dst.base, vals[0].base, vals[1].base),
             "clamp" | "smoothstep" | "mix" | "select" => {
                 // Three-operand forms where the destination is also the first
-                // source, so the first argument moves in before the operation.
-                self.push(
-                    rate,
-                    Instruction::new(OpCode::Mov, dst.base, vals[0].base, 0),
-                );
+                // source, so one argument moves in before the operation.
+                //
+                // `smoothstep` follows GLSL - smoothstep(e0, e1, x) - so its
+                // value is the LAST argument, not the first. Anyone reaching for
+                // it has written a shader before, and a silently reversed
+                // interpolation renders wrong rather than failing.
+                let (into, a, b) = match callee {
+                    "smoothstep" => (vals[2].base, vals[0].base, vals[1].base),
+                    _ => (vals[0].base, vals[1].base, vals[2].base),
+                };
+                self.push(rate, Instruction::new(OpCode::Mov, dst.base, into, 0));
                 let op = match callee {
                     "clamp" => OpCode::Clamp,
                     "smoothstep" => OpCode::SmoothStep,
                     "mix" => OpCode::Lerp,
                     _ => OpCode::Select,
                 };
-                Instruction::new(op, dst.base, vals[1].base, vals[2].base)
+                Instruction::new(op, dst.base, a, b)
             }
             other => {
                 self.diags.push(Diagnostic::error(
