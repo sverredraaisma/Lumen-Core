@@ -223,6 +223,18 @@ fn effect(out: &mut String, e: &Effect, comments: &mut Comments<'_>) {
         comments.flush_trailing(out);
     });
 
+    section(out, &e.states, |out, s| {
+        comments.flush_before(out, s.span.start, 1);
+        indent(out, 1);
+        out.push_str(&format!(
+            "state {} : {} = {}\n",
+            s.name,
+            s.ty.as_str(),
+            expr(&s.init)
+        ));
+        comments.flush_trailing(out);
+    });
+
     section(out, &e.lets, |out, b| {
         comments.flush_before(out, b.span.start, 1);
         indent(out, 1);
@@ -237,22 +249,16 @@ fn effect(out: &mut String, e: &Effect, comments: &mut Comments<'_>) {
         comments.flush_trailing(out);
     });
 
-    section(out, &e.states, |out, s| {
-        comments.flush_before(out, s.span.start, 1);
-        indent(out, 1);
-        out.push_str(&format!(
-            "state {} : {} = {}\n",
-            s.name,
-            s.ty.as_str(),
-            expr(&s.init)
-        ));
-        comments.flush_trailing(out);
-    });
-
     for f in &e.fns {
         out.push('\n');
         comments.flush_before(out, f.span.start, 1);
         fn_decl(out, f, 1);
+    }
+
+    for s in &e.sims {
+        out.push('\n');
+        comments.flush_before(out, s.span.start, 1);
+        sim(out, s, comments);
     }
 
     for l in &e.layers {
@@ -477,4 +483,85 @@ fn quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Render a `sim` block.
+///
+/// It exists because the formatter used to drop them entirely: `parse` accepted
+/// a `sim`, `fmt` never emitted one, and so a round trip through the formatter
+/// silently deleted a whole simulation. That is data loss inside the compiler's
+/// own "a round trip leaves a file a human would have written" contract, which
+/// is the one promise the text-is-canonical design rests on.
+fn sim(out: &mut String, s: &Sim, comments: &mut Comments<'_>) {
+    indent(out, 1);
+    out.push_str(&format!("sim {}(", s.name));
+    let args: Vec<String> = s
+        .args
+        .iter()
+        .map(|(name, value)| format!("{name} = {}", expr(value)))
+        .collect();
+    out.push_str(&args.join(", "));
+    out.push_str(") {\n");
+    sim_body(out, &s.body, 2, comments);
+    indent(out, 1);
+    out.push_str("}\n");
+}
+
+fn sim_body(out: &mut String, body: &[SimStmt], depth: usize, comments: &mut Comments<'_>) {
+    for stmt in body {
+        sim_stmt(out, stmt, depth, comments);
+    }
+}
+
+fn sim_stmt(out: &mut String, stmt: &SimStmt, depth: usize, comments: &mut Comments<'_>) {
+    match stmt {
+        SimStmt::Let(b) => {
+            comments.flush_before(out, b.span.start, depth);
+            indent(out, depth);
+            out.push_str(&format!("let {} = {}\n", b.name, expr(&b.value)));
+            comments.flush_trailing(out);
+        }
+        SimStmt::Assign(a) => {
+            comments.flush_before(out, a.span.start, depth);
+            indent(out, depth);
+            match &a.field {
+                Some(f) => out.push_str(&format!("{}.{} = {}\n", a.target, f, expr(&a.value))),
+                None => out.push_str(&format!("{} = {}\n", a.target, expr(&a.value))),
+            }
+            comments.flush_trailing(out);
+        }
+        SimStmt::If {
+            cond,
+            then,
+            otherwise,
+            span,
+        } => {
+            comments.flush_before(out, span.start, depth);
+            indent(out, depth);
+            out.push_str(&format!("if {} {{\n", expr(cond)));
+            sim_body(out, then, depth + 1, comments);
+            indent(out, depth);
+            if otherwise.is_empty() {
+                out.push_str("}\n");
+            } else {
+                out.push_str("} else {\n");
+                sim_body(out, otherwise, depth + 1, comments);
+                indent(out, depth);
+                out.push_str("}\n");
+            }
+        }
+        SimStmt::ForEach {
+            binding,
+            over,
+            body,
+            span,
+        } => {
+            comments.flush_before(out, span.start, depth);
+            indent(out, depth);
+            out.push_str(&format!("foreach {binding} in {over} {{\n"));
+            sim_body(out, body, depth + 1, comments);
+            indent(out, depth);
+            out.push_str("}\n");
+        }
+    }
 }

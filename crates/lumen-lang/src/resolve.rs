@@ -158,6 +158,14 @@ pub struct Signature {
     /// overloaded on arity, like `noise`.
     pub arity: &'static [usize],
     pub ret: Type,
+    /// Type of each argument, in order.
+    ///
+    /// A shorter list than the call has arguments means the last entry repeats -
+    /// `rgb` takes three floats, `clamp` three floats, and writing them out
+    /// would be noise. Exposed because an editor cannot check a connection into
+    /// an argument port without it, and refusing to check is how a graph editor
+    /// lets you wire a palette into a number.
+    pub args: &'static [Type],
 }
 
 /// The frozen core: one instruction each, or a short inline sequence.
@@ -166,196 +174,235 @@ pub const CORE_FNS: &[Signature] = &[
         name: "abs",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "ceil",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "round",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "trunc",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "sign",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "mod",
         arity: &[2],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "tan",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "distance",
         arity: &[2],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "normalize",
         arity: &[1],
         ret: Type::Vec3,
+        args: &[Type::Vec3],
     },
     Signature {
         name: "cross",
         arity: &[2],
         ret: Type::Vec3,
+        args: &[Type::Vec3],
     },
     Signature {
         name: "floor",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "fract",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "sqrt",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "sin",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "cos",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "sin01",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "cos01",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "exp",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "log",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "pow",
         arity: &[2],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "atan2",
         arity: &[2],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "min",
         arity: &[2],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "max",
         arity: &[2],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "clamp",
         arity: &[3],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "step",
         arity: &[2],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "smoothstep",
         arity: &[3],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "mix",
         arity: &[3],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "select",
         arity: &[3],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "noise1",
         arity: &[1],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "noise2",
         arity: &[2],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "noise3",
         arity: &[3],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "length",
         arity: &[2, 3],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "dot",
         arity: &[2],
         ret: Type::Float,
+        args: &[Type::Float],
     },
     Signature {
         name: "vec2",
         arity: &[2],
         ret: Type::Vec2,
+        args: &[Type::Float],
     },
     Signature {
         name: "vec3",
         arity: &[3],
         ret: Type::Vec3,
+        args: &[Type::Float],
     },
     Signature {
         name: "rgb",
         arity: &[3],
         ret: Type::Color,
+        args: &[Type::Float],
     },
     Signature {
         name: "hsv",
         arity: &[3],
         ret: Type::Color,
+        args: &[Type::Float],
     },
     Signature {
         name: "temp",
         arity: &[2],
         ret: Type::Color,
+        args: &[Type::Float],
     },
     Signature {
         name: "palette",
         arity: &[2],
         ret: Type::Color,
+        args: &[Type::Palette, Type::Float],
     },
 ];
 

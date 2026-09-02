@@ -1643,3 +1643,99 @@ fn placement_survives_a_second_format() {
     let (twice, _) = format_source(&once);
     assert_eq!(once, twice.unwrap(), "placement moved on the second pass");
 }
+
+// ---- Round trips that used to lose data ------------------------------------
+
+#[test]
+fn the_formatter_keeps_sim_blocks() {
+    // It used to drop them: `parse` accepted a `sim`, `fmt` never emitted one,
+    // so a round trip through the formatter silently deleted a whole
+    // simulation. That is data loss inside the compiler's own "a round trip
+    // leaves a file a human would have written" contract - the one promise the
+    // text-is-canonical design rests on. Found by the graph editor, which
+    // refused to open such a file rather than eat one on save.
+    let src = r#"
+lumen 1
+effect "particles" {
+  sim swarm(count = 64, gravity = 0.5) {
+    let step = 1
+    pos = pos + step
+    if pos > 1 {
+      pos = 0
+    } else {
+      pos = pos + 0.1
+    }
+    foreach p in particles {
+      p.vel = p.vel * 0.99
+    }
+  }
+  layer base { color = rgb(1, 0, 0) }
+}
+"#;
+    let (out, diags) = format_source(src);
+    assert!(!diags.has_errors(), "{}", diags.render(src));
+    let out = out.unwrap();
+    for needle in [
+        "sim swarm(count = 64, gravity = 0.5)",
+        "let step = 1",
+        "pos = pos + step",
+        "if pos > 1 {",
+        "} else {",
+        "foreach p in particles {",
+        "p.vel = p.vel * 0.99",
+    ] {
+        assert!(out.contains(needle), "lost {needle}:\n{out}");
+    }
+
+    // And it survives a second pass unchanged.
+    let (again, d2) = format_source(&out);
+    assert!(!d2.has_errors(), "{}", d2.render(&out));
+    assert_eq!(out, again.unwrap());
+}
+
+#[test]
+fn declarations_are_printed_in_the_order_they_are_scoped() {
+    // `resolve` registers states before lets, so a `let` may read a state. The
+    // formatter used to print states last, so the visible order contradicted
+    // the scoping order and anyone reading the file would guess wrong.
+    let src = r#"
+lumen 1
+effect "order" {
+  let after = 1
+  state trail : color = rgb(0, 0, 0)
+  layer l { color = trail }
+}
+"#;
+    let (out, diags) = format_source(src);
+    assert!(!diags.has_errors(), "{}", diags.render(src));
+    let out = out.unwrap();
+    let state_at = out.find("state trail").expect("lost the state");
+    let let_at = out.find("let after").expect("lost the let");
+    assert!(
+        state_at < let_at,
+        "states must print before lets, as they are scoped:\n{out}"
+    );
+}
+
+#[test]
+fn core_signatures_expose_their_argument_types() {
+    // An editor cannot check a connection into an argument port without them,
+    // and refusing to check is how a graph editor lets you wire a palette into
+    // a number.
+    use lumen_lang::resolve::core_fn;
+    let palette = core_fn("palette").expect("palette is a core function");
+    assert_eq!(palette.args.first(), Some(&lumen_lang::ast::Type::Palette));
+    assert_eq!(palette.args.get(1), Some(&lumen_lang::ast::Type::Float));
+
+    let normalize = core_fn("normalize").unwrap();
+    assert_eq!(normalize.args.first(), Some(&lumen_lang::ast::Type::Vec3));
+
+    // Every core function says something about its arguments.
+    for sig in lumen_lang::resolve::CORE_FNS {
+        assert!(
+            !sig.args.is_empty(),
+            "`{}` declares no argument types",
+            sig.name
+        );
+    }
+}
