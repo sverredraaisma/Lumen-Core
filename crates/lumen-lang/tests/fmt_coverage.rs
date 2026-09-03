@@ -36,67 +36,178 @@ fn comment_texts(src: &str) -> Vec<String> {
         .collect()
 }
 
-// ---- The example corpus ----------------------------------------------------
+// ---- The corpus ------------------------------------------------------------
 
-/// Every shipped example, as (name, source).
+/// Sources the round-trip properties are checked against.
 ///
-/// Compiled in rather than read from disk: the crate is `no_std`, the corpus is
-/// in a sibling repo directory, and a test that silently passes because it found
-/// no files is worse than no test at all.
+/// Hand-written rather than read from the shipped examples in `lumen-effects`.
+/// That sibling is not checked out in this repo's CI — `lumen-core` is
+/// deliberately self-contained — and the corpus is already format-checked where
+/// it lives, by `lumen-effects` CI running the real `lumen fmt --check` over
+/// every example.
+///
+/// Writing them here is also strictly stronger for what these tests assert. The
+/// shipped examples contain no `sim` block and no `curve`, so counting those on
+/// both sides of a format would have compared zero with zero — and a dropped
+/// `sim` is the exact regression this file exists to catch.
 const CORPUS: &[(&str, &str)] = &[
-    (
-        "01-breathe",
-        include_str!("../../../../lumen-effects/examples/01-breathe/effect.lfx"),
-    ),
-    (
-        "02-tide",
-        include_str!("../../../../lumen-effects/examples/02-tide/effect.lfx"),
-    ),
-    (
-        "03-drift",
-        include_str!("../../../../lumen-effects/examples/03-drift/effect.lfx"),
-    ),
-    (
-        "04-pulse",
-        include_str!("../../../../lumen-effects/examples/04-pulse/effect.lfx"),
-    ),
-    (
-        "05-beat-strobe",
-        include_str!("../../../../lumen-effects/examples/05-beat-strobe/effect.lfx"),
-    ),
-    (
-        "06-level-meter",
-        include_str!("../../../../lumen-effects/examples/06-level-meter/effect.lfx"),
-    ),
-    (
-        "07-alert",
-        include_str!("../../../../lumen-effects/examples/07-alert/effect.lfx"),
-    ),
-    (
-        "08-air-quality",
-        include_str!("../../../../lumen-effects/examples/08-air-quality/effect.lfx"),
-    ),
-    (
-        "09-progress",
-        include_str!("../../../../lumen-effects/examples/09-progress/effect.lfx"),
-    ),
-    (
-        "10-comet",
-        include_str!("../../../../lumen-effects/examples/10-comet/effect.lfx"),
-    ),
-    (
-        "11-chase",
-        include_str!("../../../../lumen-effects/examples/11-chase/effect.lfx"),
-    ),
-    (
-        "12-panel-plasma",
-        include_str!("../../../../lumen-effects/examples/12-panel-plasma/effect.lfx"),
-    ),
-    (
-        "13-ember",
-        include_str!("../../../../lumen-effects/examples/13-ember/effect.lfx"),
-    ),
+    ("every-declaration", EVERY_DECLARATION),
+    ("comments-everywhere", COMMENTS_EVERYWHERE),
+    ("minimal", MINIMAL),
 ];
+
+/// One of every declaration the formatter has to write back out.
+const EVERY_DECLARATION: &str = r#"lumen 1
+
+palette warm {
+  space linear_rgb
+  0 #2fd07a
+  1 #d1443c
+}
+
+curve ease {
+  0 0
+  0.5 0.8
+  1 1
+}
+
+fn falloff(d : float, k : float) -> float {
+  let s = d * k
+  return 1 - clamp(s, 0, 1)
+}
+
+effect "Every Declaration" {
+  version 1
+  author "lumen-core tests"
+  stdlib 1
+  requires grid
+  fps 60
+
+  param speed : float = 0.15 range 0.02..1 label "Speed"
+  param tint : color = #204080 label "Tint"
+
+  channel bass : value hold 400 default 0
+
+  state heat : color = rgb(0, 0, 0)
+
+  let phase = sine01(t * speed)
+  let energy = clamp(bass, 0, 1)
+
+  mask upper = z > 0.5
+
+  fn boost(v : float) -> float {
+    return v * v
+  }
+
+  sim embers(count = 64, gravity = 0.2) {
+    let drift = gravity * dt
+    foreach e in embers {
+      e.y = e.y - drift
+      if e.y < 0 {
+        e.y = 1
+      } else {
+        e.life = e.life - dt
+      }
+    }
+  }
+
+  layer base {
+    let pos = u * phase
+    color = palette(warm, pos) * boost(energy)
+  }
+
+  layer top mask(upper) blend add {
+    heat = prev * 0.9
+    color = tint * falloff(v, 2)
+  }
+}
+"#;
+
+/// Comments in every position the lexer distinguishes.
+const COMMENTS_EVERYWHERE: &str = r#"lumen 1
+
+# A comment before the effect.
+
+effect "Comments" {
+  version 1
+  author "lumen-core tests"
+  stdlib 1
+  fps 60
+
+  # An own-line comment with a blank line before it.
+  param speed : float = 0.15 range 0.02..1 label "Speed"  # and a trailing one
+
+  #
+  let phase = sine01(t * speed)
+
+  layer base {
+    # Inside a layer.
+    color = rgb(phase, 0, 0)  # trailing, inside a layer
+  }
+}
+"#;
+
+/// The smallest thing that is still an effect.
+const MINIMAL: &str = r#"lumen 1
+
+effect "Minimal" {
+  version 1
+  author "lumen-core tests"
+  stdlib 1
+  fps 60
+
+  layer base {
+    color = rgb(0, 0, 0)
+  }
+}
+"#;
+
+/// Every fixture must parse, or the properties below are vacuous.
+#[test]
+fn every_fixture_in_the_corpus_parses() {
+    for (name, src) in CORPUS {
+        let (file, diags) = parse(src);
+        assert!(
+            !diags.has_errors(),
+            "{name}:
+{}",
+            diags.render(src)
+        );
+        assert!(file.is_some(), "{name} did not parse");
+    }
+}
+
+/// And between them they must actually contain the declarations the properties
+/// below count, or "kept every declaration" compares zero with zero.
+#[test]
+fn the_corpus_exercises_every_declaration_kind() {
+    let (file, _) = parse(EVERY_DECLARATION);
+    let file = file.expect("parsed");
+    assert!(file.decls.len() >= 4, "palette, curve, fn and effect");
+    let effect = file
+        .decls
+        .iter()
+        .find_map(|d| match d {
+            Decl::Effect(e) => Some(e),
+            _ => None,
+        })
+        .expect("an effect");
+    assert!(!effect.params.is_empty(), "params");
+    assert!(!effect.channels.is_empty(), "channels");
+    assert!(!effect.states.is_empty(), "states");
+    assert!(!effect.lets.is_empty(), "lets");
+    assert!(!effect.masks.is_empty(), "masks");
+    assert!(!effect.fns.is_empty(), "fns");
+    assert!(
+        !effect.sims.is_empty(),
+        "sims - the dropped-sim regression guard"
+    );
+    assert!(effect.layers.len() >= 2, "layers");
+    assert!(
+        !comment_texts(COMMENTS_EVERYWHERE).is_empty(),
+        "the comment fixture must contain comments"
+    );
+}
 
 #[test]
 fn every_example_formats_idempotently() {

@@ -12,7 +12,7 @@
 //!   1  the file was rejected, or a limit was exceeded
 //!   2  the command line was wrong
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -440,51 +440,13 @@ fn check_rejects_a_bad_effect() {
 }
 
 // ---- the corpus ------------------------------------------------------------
-
-/// Every checked-in example must compile with the shipped binary.
-///
-/// The corpus lives in the sibling `lumen-effects` checkout, which is not
-/// guaranteed to be present, so this skips rather than fails when it is absent —
-/// a missing sibling is a workspace-layout fact, not a defect in this crate.
-#[test]
-fn every_example_in_the_sibling_corpus_compiles() {
-    let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../lumen-effects/examples")
-        .canonicalize();
-    let Ok(corpus) = corpus else {
-        eprintln!("skipping: no ../lumen-effects checkout");
-        return;
-    };
-
-    let s = Scratch::new();
-    let mut seen = 0;
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&corpus)
-        .expect("read corpus")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .collect();
-    entries.sort();
-
-    for dir in entries {
-        let effect = dir.join("effect.lfx");
-        if !effect.is_file() {
-            continue;
-        }
-        seen += 1;
-        let out_path = s.path(&format!("{seen}.lfxb"));
-        let out = lumen(&[
-            "compile",
-            effect.to_str().unwrap(),
-            "-o",
-            out_path.to_str().unwrap(),
-            "--quiet",
-        ]);
-        assert_eq!(
-            code(&out),
-            0,
-            "{} must compile, stderr: {}",
-            effect.display(),
-            stderr(&out)
-        );
-    }
-    assert!(seen > 0, "the corpus directory exists but held no effects");
-}
+//
+// There is deliberately no test here that compiles the shipped examples. They
+// live in the sibling `lumen-effects` repo, which this repo's CI does not check
+// out — `lumen-core` is self-contained on purpose — so such a test would find
+// nothing and silently pass on every CI run, which is worse than not having it.
+//
+// The corpus is covered where it lives: `lumen-effects` CI builds this binary
+// from a sibling checkout and runs `lumen budget --max` over every example
+// against the ceiling in its manifest.toml, plus `lumen fmt --check` over every
+// source. That is the check that fails when a compiler change breaks an effect.
