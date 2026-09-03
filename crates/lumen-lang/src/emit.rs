@@ -160,6 +160,45 @@ struct Emitter<'a, 'd> {
 /// deep nesting; either way a diagnostic beats a stack overflow in the compiler.
 const MAX_INLINE_DEPTH: u8 = 16;
 
+/// For each layer-local `let`, the index of the last statement that reads it.
+///
+/// `usize::MAX` means "to the end of the layer": read by the colour assign, a
+/// `state` write, the opacity or the mask, all of which come after every `let`.
+/// Anything else is the index of the latest later `let` that mentions it.
+///
+/// Conservative by construction — a value that is actually dead may be reported
+/// live, which costs a register — because the other direction emits a read of a
+/// register something else has overwritten, and that renders as a colour nobody
+/// chose.
+fn layer_let_last_use(layer: &Layer) -> Vec<usize> {
+    let mut out = alloc::vec![usize::MAX; layer.lets.len()];
+    for (i, b) in layer.lets.iter().enumerate() {
+        // Anything after the `let` block keeps it alive to the end.
+        let after_the_lets = layer
+            .assigns
+            .iter()
+            .any(|a| crate::ast::mentions(&a.value, &b.name))
+            || layer
+                .opacity
+                .as_ref()
+                .is_some_and(|o| crate::ast::mentions(o, &b.name));
+        if after_the_lets {
+            continue;
+        }
+        // Otherwise the last later `let` that mentions it, or itself if none
+        // does — an unread `let` is dead the moment it is written, and the
+        // resolver has already warned about it.
+        let mut last = i;
+        for (j, other) in layer.lets.iter().enumerate().skip(i + 1) {
+            if crate::ast::mentions(&other.value, &b.name) {
+                last = j;
+            }
+        }
+        out[i] = last;
+    }
+    out
+}
+
 impl Emitter<'_, '_> {
     fn run(&mut self) {
         self.emit_palettes();
@@ -328,17 +367,49 @@ impl Emitter<'_, '_> {
         // handful of layers exhausts the register file.
         let saved_bound = self.bound.len();
         let saved_floor = self.temp_floor;
-        for b in &layer.lets {
+        // How long each layer-local `let` has to survive.
+        //
+        // Without this every one of them holds its register until the layer
+        // ends, and a chain of them — `let a = ...`, `let b = f(a)`,
+        // `let c = g(b)` — pins three registers while the colour expression,
+        // which is where the peak actually is, needs only the last. Two of the
+        // shipped examples sat at exactly 32 of 32 for this reason.
+        let last_use = layer_let_last_use(layer);
+
+        // The registers handed out to layer-local `let`s, in order, so dead ones
+        // can be handed back from the top.
+        let mut let_regs: Vec<(Val, usize)> = Vec::new();
+
+        for (i, b) in layer.lets.iter().enumerate() {
             self.next_temp = self.temp_floor;
             let Some(v) = self.expr(Rate::Pixel, &b.value) else {
                 return;
             };
-            // Park it above the temporaries so the next expression does not
-            // stamp on it.
             let width = v.width;
+
+            // Anything whose last reader was this statement is now dead. Pop
+            // from the top only: a stack allocator cannot free a hole, and the
+            // chains this exists for die from the top anyway. Freeing before
+            // the destination is allocated is what lets the destination land
+            // where a dead value was.
+            while let Some(&(reg, dead_after)) = let_regs.last() {
+                if dead_after > i {
+                    break;
+                }
+                self.temp_floor = reg.base;
+                let_regs.pop();
+            }
+
+            self.next_temp = self.temp_floor;
+            // Park it below the temporaries so the next expression does not
+            // stamp on it.
             let Some(dst) = self.temp(width) else { return };
+            // `move_into` copies ascending, so a destination below an
+            // overlapping source is safe: every byte it overwrites has already
+            // been read.
             self.move_into(Rate::Pixel, dst, v);
             self.temp_floor = self.next_temp;
+            let_regs.push((dst, last_use[i]));
             self.bound.push((b.name.clone(), dst));
         }
 

@@ -215,7 +215,12 @@ fn packing_refuses_to_collapse_onto_a_source_it_would_clobber() {
     // components still had to be read. It allocates fresh instead - the case
     // that produced silently wrong output when the collapse was assumed safe
     // rather than checked.
-    let src = wrap("  layer l {\n    let a = -vec3(x, y, z)\n    color = rgb(a.x, a.y, a.z)\n  }");
+    let src = wrap(
+        "  layer l {
+    let a = -vec3(x, y, z)
+    color = rgb(a.x, a.y, a.z)
+  }",
+    );
     let ins = pixel(&src);
     assert_eq!(
         steps_of(&ins),
@@ -228,23 +233,26 @@ fn packing_refuses_to_collapse_onto_a_source_it_would_clobber() {
             (OpCode::Neg, 21, 18, 0),
             (OpCode::Neg, 22, 19, 0),
             (OpCode::Neg, 23, 20, 0),
-            // Parked above the temporaries, because the layer binds it.
-            (OpCode::Mov, 24, 21, 0),
-            (OpCode::Mov, 25, 22, 0),
-            (OpCode::Mov, 26, 23, 0),
-            // The rgb pack cannot collapse onto 24: that is where `a.x` lives.
-            (OpCode::Mov, 29, 26, 0),
-            (OpCode::Mov, 28, 25, 0),
-            (OpCode::Mov, 27, 24, 0),
-            (OpCode::Mov, 15, 27, 0),
-            (OpCode::Mov, 16, 28, 0),
-            (OpCode::Mov, 17, 29, 0),
+            // The binding comes home to the bottom of its own scratch, which
+            // is where the vector it was built from used to be. Everything the
+            // expression borrowed above it is dead once the value has moved.
+            (OpCode::Mov, 18, 21, 0),
+            (OpCode::Mov, 19, 22, 0),
+            (OpCode::Mov, 20, 23, 0),
+            // The rgb pack cannot collapse onto 18: that is where `a.x` lives.
+            (OpCode::Mov, 23, 20, 0),
+            (OpCode::Mov, 22, 19, 0),
+            (OpCode::Mov, 21, 18, 0),
+            (OpCode::Mov, 15, 21, 0),
+            (OpCode::Mov, 16, 22, 0),
+            (OpCode::Mov, 17, 23, 0),
             (OpCode::EmitRgb, 15, 16, 17),
         ],
         "{ins:#?}"
     );
-    // It fits, but only just: this is the shape that exhausts the file first.
-    assert_eq!(registers(&src), 30);
+    // Still the widest shape the language can express in one binding, and it now
+    // leaves eight registers spare rather than two.
+    assert_eq!(registers(&src), 24);
 }
 
 // ---- Forms that need a contiguous run --------------------------------------
@@ -990,9 +998,20 @@ fn running_out_of_permanent_registers_is_reported_too() {
 fn a_layer_opacity_that_cannot_be_allocated_fails_the_whole_compile() {
     // Opacity is evaluated after the layer's colour, so it is the last thing to
     // run out of registers - and the compile has to fail rather than emit a
-    // layer that composites unscaled. Tuned so the colour still fits (`prev`
-    // needs no scratch at all) and only the opacity does not.
-    let src = "lumen 1\neffect \"x\" {\n  layer l opacity length(x, y, z) {\n    let a = vec3(x, y, z)\n    let b = vec3(x, y, z)\n    color = prev\n  }\n}\n";
+    // layer that composites unscaled.
+    //
+    // Both bindings are read by the colour, so both are still live when the
+    // opacity runs. Tuned so the colour itself still fits and only the opacity
+    // does not.
+    let src = "lumen 1
+effect \"x\" {
+  layer l opacity length(x, y, z) {
+    let a = vec3(x, y, z)
+    let b = vec3(x + 1, y, z)
+    color = rgb(a.x + b.x, y, z)
+  }
+}
+";
     assert_eq!(
         errors(src),
         ["the effect needs more registers than the VM has"]
@@ -1003,15 +1022,31 @@ fn a_layer_opacity_that_cannot_be_allocated_fails_the_whole_compile() {
 fn a_state_assignment_that_cannot_be_allocated_fails_the_whole_compile() {
     // A `state` write goes straight into the history registers, but the
     // expression feeding it still needs scratch like anything else.
-    // Tuned so the layer's own bindings all fit and only the state expression
-    // does not: it is emitted before the colour, so this is the state path, not
-    // the colour one.
-    let mut src =
-        String::from("lumen 1\neffect \"x\" {\n  state h : color = rgb(0, 0, 0)\n  layer l {\n");
-    for i in 0..2 {
-        src.push_str(&format!("    let q{i} = vec3(x + {i}, y, z)\n"));
+    //
+    // Every binding is read by the state expression, so none can be handed back
+    // early. That is load-bearing: a binding nobody reads is dead the moment it
+    // is written and costs nothing, so a version of this test with unread
+    // bindings would fit comfortably and prove nothing.
+    let mut src = String::from(
+        "lumen 1
+effect \"x\" {
+  state h : color = rgb(0, 0, 0)
+  layer l {
+",
+    );
+    for i in 0..4 {
+        src.push_str(&format!(
+            "    let q{i} = vec3(x + {i}, y, z)
+"
+        ));
     }
-    src.push_str("    h = vec3(x, y, z)\n    color = prev\n  }\n}\n");
+    src.push_str(
+        "    h = vec3(q0.x + q1.x + q2.x + q3.x, y, z)
+    color = prev
+  }
+}
+",
+    );
     assert_eq!(
         errors(&src),
         ["the effect needs more registers than the VM has"]

@@ -544,9 +544,105 @@ pub fn const_value(e: &Expr) -> Option<alloc::vec::Vec<f64>> {
     }
 }
 
+/// Whether `name` is read anywhere in `e`.
+///
+/// Used to work out when a `let` inside a layer is dead, so its register can be
+/// handed back. A conservative answer is always safe here: reporting a mention
+/// that is not there costs a register, reporting none that is there would emit a
+/// read of a register something else has since overwritten.
+pub fn mentions(e: &Expr, name: &str) -> bool {
+    match &e.kind {
+        ExprKind::Ident(n) => n == name,
+        ExprKind::Number { .. } | ExprKind::Color(_) | ExprKind::Str(_) => false,
+        ExprKind::Field { base, .. } => mentions(base, name),
+        ExprKind::Call { args, .. } => args.iter().any(|a| mentions(a, name)),
+        ExprKind::MethodCall { base, args, .. } => {
+            mentions(base, name) || args.iter().any(|a| mentions(a, name))
+        }
+        ExprKind::Binary { lhs, rhs, .. } => mentions(lhs, name) || mentions(rhs, name),
+        ExprKind::Unary { operand, .. } => mentions(operand, name),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse one expression out of a layer's `color`, so `mentions` is tested
+    /// against trees the parser actually builds rather than ones hand-assembled
+    /// here. A hand-built tree can be a shape the grammar cannot produce, and
+    /// then the test proves nothing about real source.
+    fn expr_of(text: &str) -> Expr {
+        let src = alloc::format!(
+            "lumen 1
+effect \"x\" {{
+  version 1
+  author \"t\"
+  stdlib 1
+  fps 60
+  layer l {{ color = {text} }}
+}}
+"
+        );
+        let (file, diags) = crate::parse::parse(&src);
+        assert!(!diags.has_errors(), "{}", diags.render(&src));
+        let file = file.expect("parsed");
+        let Decl::Effect(e) = &file.decls[0] else {
+            panic!("expected an effect")
+        };
+        e.layers[0].assigns[0].value.clone()
+    }
+
+    #[test]
+    fn mentions_finds_a_name_through_every_kind_of_expression() {
+        // One case per `ExprKind`, because the walker missing a variant is
+        // silent: the value looks dead, its register is handed back, and
+        // something else overwrites it before the read.
+        for text in [
+            "wanted",                        // Ident
+            "wanted.x",                      // Field
+            "rgb(wanted, 0, 0)",             // Call
+            "sim.influence(wanted, 1)",      // MethodCall through an argument
+            "wanted + 1",                    // Binary, left
+            "1 + wanted",                    // Binary, right
+            "-wanted",                       // Unary
+            "rgb(max(0, wanted * 2), 0, 0)", // nested
+        ] {
+            assert!(
+                mentions(&expr_of(text), "wanted"),
+                "`{text}` mentions `wanted`"
+            );
+        }
+    }
+
+    #[test]
+    fn mentions_says_no_when_the_name_is_absent() {
+        for text in [
+            "1.5",                     // Number
+            "#204080",                 // Color
+            "other",                   // a different Ident
+            "other.x",                 // Field
+            "rgb(other, 0, 0)",        // Call
+            "other + 1",               // Binary
+            "-other",                  // Unary
+            "sim.influence(other, 1)", // MethodCall
+        ] {
+            assert!(
+                !mentions(&expr_of(text), "wanted"),
+                "`{text}` does not mention `wanted`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_only_a_prefix_does_not_count() {
+        // `want` is not `wanted`. A prefix match here would keep a binding
+        // alive for no reason, which is merely wasteful — but the reverse, a
+        // suffix or substring match, would be the dangerous direction, so pin
+        // that the comparison is whole-name.
+        assert!(!mentions(&expr_of("want + 1"), "wanted"));
+        assert!(!mentions(&expr_of("wantedmore + 1"), "wanted"));
+    }
 
     #[test]
     fn every_capability_maps_both_ways() {
