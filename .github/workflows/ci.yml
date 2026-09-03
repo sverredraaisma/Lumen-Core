@@ -47,6 +47,49 @@ jobs:
       - run: cargo build -p lumen-vm --target riscv32imc-unknown-none-elf
       - run: cargo build -p lumen-hal --target riscv32imc-unknown-none-elf
 
+  conformance:
+    name: codec conformance vectors
+    runs-on: ubuntu-latest
+    steps:
+      # Two checkouts: this repo, and lumen-spec for the vectors and the runner.
+      # That is the point of the job — the vectors are normative and live in
+      # another repo, so nothing here can quietly change what conformance means.
+      - uses: actions/checkout@v4
+        with:
+          path: lumen-core
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/Lumen-Spec
+          path: lumen-spec
+          ref: main
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lumen-core/adapters/conformance
+      # The adapter is outside the workspace, so the fmt and clippy job never
+      # sees it. Held to the same bar here rather than left as the one unchecked
+      # crate in the repo.
+      - name: the adapter is formatted and lint-clean
+        working-directory: lumen-core/adapters/conformance
+        run: |
+          cargo fmt -- --check
+          cargo clippy --all-targets
+        env:
+          RUSTFLAGS: -D warnings
+      - name: build the adapter
+        working-directory: lumen-core/adapters/conformance
+        run: cargo build --release
+      # `lumen-proto` is hand-written rather than generated from the IDL, and
+      # this job is the reason that is safe. Both directions: an encoder and a
+      # decoder tested only against each other agree with each other forever.
+      - name: round-trip every codec vector
+        working-directory: lumen-spec
+        run: |
+          adapter="../lumen-core/adapters/conformance/target/release/lumen-proto-adapter"
+          cargo run --release --bin lumen-conformance -- --adapter "$adapter" vectors/codec/
+
   coverage:
     name: coverage >= 95%
     runs-on: ubuntu-latest

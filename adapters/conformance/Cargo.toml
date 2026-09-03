@@ -1,0 +1,23 @@
+[package]
+name = "lumen-proto-adapter"
+description = "Conformance adapter: drives lumen-proto's codec from lumen-spec's codec vectors"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/sverredraaisma/Lumen-Core"
+rust-version = "1.85"
+authors = ["The Lumen contributors"]
+
+[[bin]]
+name = "lumen-proto-adapter"
+path = "src/main.rs"
+
+[dependencies]
+lumen-proto = { version = "0.1.0", path = "../../crates/lumen-proto" }
+
+# The runner's own JSON and hex, so the adapter cannot disagree with it about
+# what a vector says.
+#
+# Path rather than a version: nothing is published yet.
+# TODO(release): becomes `lumen-conformance = "0.1"`.
+lumen-conformance = { version = "0.1.0", path = "../../../lumen-spec/runner" }
