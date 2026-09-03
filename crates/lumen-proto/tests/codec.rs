@@ -9,7 +9,7 @@
 //! something malformed reaches it, so every "must be refused" rule in the wire
 //! format gets a test here.
 
-use lumen_proto::buf::Writer;
+use lumen_proto::buf::{Reader, Writer};
 use lumen_proto::msg::*;
 use lumen_proto::{DecodeError, EncodeError, MsgType, Payload, Uuid};
 
@@ -767,6 +767,164 @@ fn an_empty_body_is_refused_for_every_type_that_needs_one() {
             Payload::decode(t, &[]),
             Err(DecodeError::Truncated),
             "{t:?} accepted an empty body"
+        );
+    }
+}
+
+// ---- replication ------------------------------------------------------------
+//
+// The three STATE_* messages are the only ones whose payload is a variable-length
+// list the codec has to walk rather than a fixed struct, and they were the only
+// three never driven through `Payload`. That matters more than the count
+// suggests: replication is what makes a keeper's death survivable, and a codec
+// that cannot carry a digest cannot resync a mesh that has split.
+
+#[test]
+fn a_state_digest_round_trips_and_yields_its_entries() {
+    let entries = [
+        DigestEntry {
+            record_id: uuid(1),
+            hlc: 0x0102_0304_0506_0708,
+        },
+        DigestEntry {
+            record_id: uuid(2),
+            hlc: 9,
+        },
+    ];
+
+    let mut buf = [0u8; 256];
+    let n = {
+        let mut w = Writer::new(&mut buf);
+        StateDigest::encode_from(&entries, &mut w).expect("encode_from");
+        w.position()
+    };
+
+    let mut r = Reader::new(&buf[..n]);
+    let digest = StateDigest::decode(&mut r).expect("decode");
+    assert_eq!(digest.count, 2);
+    let got: Vec<DigestEntry> = digest.entries().collect();
+    assert_eq!(got, entries.to_vec(), "entries must survive the walk");
+
+    let payload = Payload::StateDigest(digest);
+    assert_eq!(payload.msg_type(), MsgType::StateDigest);
+    assert_round_trips(&payload);
+}
+
+#[test]
+fn an_empty_state_digest_is_legal() {
+    // "I have nothing" is a real answer during gossip, not an error.
+    let mut buf = [0u8; 8];
+    let n = {
+        let mut w = Writer::new(&mut buf);
+        StateDigest::encode_from(&[], &mut w).expect("encode_from");
+        w.position()
+    };
+    let mut r = Reader::new(&buf[..n]);
+    let digest = StateDigest::decode(&mut r).expect("decode");
+    assert_eq!(digest.count, 0);
+    assert_eq!(digest.entries().count(), 0);
+    assert_round_trips(&Payload::StateDigest(digest));
+}
+
+#[test]
+fn a_state_pull_round_trips_and_yields_its_ids() {
+    let ids = [uuid(7), uuid(8), uuid(9)];
+    let mut buf = [0u8; 256];
+    let n = {
+        let mut w = Writer::new(&mut buf);
+        StatePull::encode_from(&ids, &mut w).expect("encode_from");
+        w.position()
+    };
+
+    let mut r = Reader::new(&buf[..n]);
+    let pull = StatePull::decode(&mut r).expect("decode");
+    assert_eq!(pull.count, 3);
+    assert_eq!(pull.ids().collect::<Vec<Uuid>>(), ids.to_vec());
+
+    let payload = Payload::StatePull(pull);
+    assert_eq!(payload.msg_type(), MsgType::StatePull);
+    assert_round_trips(&payload);
+}
+
+#[test]
+fn a_state_push_round_trips_records_of_differing_body_lengths() {
+    // Records are variable length and the message carries no byte count, so the
+    // decoder has to walk them. Two different body lengths is the smallest case
+    // that would catch a decoder assuming a fixed stride.
+    let sig_a = [0xAAu8; 64];
+    let sig_b = [0xBBu8; 64];
+    let records = [
+        StateRecord {
+            record_id: uuid(1),
+            record_type: 3,
+            hlc: 100,
+            author: uuid(2),
+            body: b"first",
+            sig: &sig_a,
+        },
+        StateRecord {
+            record_id: uuid(3),
+            record_type: 4,
+            hlc: 101,
+            author: uuid(4),
+            body: b"",
+            sig: &sig_b,
+        },
+    ];
+
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut w = Writer::new(&mut buf);
+        StatePush::encode_from(&records, &mut w).expect("encode_from");
+        w.position()
+    };
+
+    let mut r = Reader::new(&buf[..n]);
+    let push = StatePush::decode(&mut r).expect("decode");
+    assert_eq!(push.count, 2);
+    assert_eq!(
+        r.remaining(),
+        0,
+        "decode must consume exactly the records and no more"
+    );
+
+    let got: Vec<StateRecord<'_>> = push.records().collect();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].body, b"first");
+    assert_eq!(got[0].sig, &sig_a);
+    assert_eq!(got[1].body, b"", "an empty body must survive");
+    assert_eq!(got[1].record_type, 4);
+
+    let payload = Payload::StatePush(push);
+    assert_eq!(payload.msg_type(), MsgType::StatePush);
+    assert_round_trips(&payload);
+}
+
+#[test]
+fn a_truncated_state_push_is_refused_rather_than_walked_off_the_end() {
+    let sig = [0u8; 64];
+    let records = [StateRecord {
+        record_id: uuid(1),
+        record_type: 1,
+        hlc: 5,
+        author: uuid(2),
+        body: b"body",
+        sig: &sig,
+    }];
+    let mut buf = [0u8; 512];
+    let n = {
+        let mut w = Writer::new(&mut buf);
+        StatePush::encode_from(&records, &mut w).expect("encode_from");
+        w.position()
+    };
+
+    // Every proper prefix must be rejected: the count says one record is
+    // coming, and anything short of all of it is malformed.
+    for cut in 2..n {
+        let mut r = Reader::new(&buf[..cut]);
+        assert!(
+            StatePush::decode(&mut r).is_err(),
+            "a {cut}-byte prefix of a {n}-byte STATE_PUSH must be refused"
         );
     }
 }
