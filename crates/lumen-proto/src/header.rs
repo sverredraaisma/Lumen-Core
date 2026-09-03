@@ -45,6 +45,25 @@ pub const TAG_LEN: usize = 16;
 /// Header plus tag — the fixed cost of a datagram.
 pub const OVERHEAD: usize = HEADER_LEN + TAG_LEN;
 
+/// The largest datagram this protocol sends, header and tag included.
+///
+/// 1200 rather than something near a 1500-byte Ethernet MTU because a
+/// surprising number of home networks have a tunnel somewhere in the path — a
+/// VPN, a mesh-WiFi backhaul, a carrier doing PPPoE — and each shaves the usable
+/// size. Fragmentation exists for what genuinely needs more, but a show that
+/// fragments every frame has turned one lost packet into two, so the common path
+/// is sized to fit.
+///
+/// The limit is on the whole datagram rather than the payload inside it: what
+/// has to survive the path is the packet, and a rule about the payload alone
+/// would be [`OVERHEAD`] bytes wrong in exactly the case where it matters.
+pub const MAX_DATAGRAM: usize = 1200;
+
+/// The largest message payload that fits in a datagram without fragmenting.
+///
+/// What the compiler assumes when sizing a `CHAN` payload.
+pub const MAX_PAYLOAD: usize = MAX_DATAGRAM - OVERHEAD;
+
 /// Header `flags` bits. Everything not named here is reserved: zero on send,
 /// ignored on receive.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -302,6 +321,24 @@ impl Header {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_size_limits_agree_with_each_other() {
+        // Stated separately because callers want each, and derived so they
+        // cannot drift: a payload limit that did not account for the header and
+        // tag would overflow the datagram by exactly the overhead, which is the
+        // bug this arithmetic exists to prevent.
+        assert_eq!(MAX_DATAGRAM, 1200, "the wire format fixes this at 1200");
+        assert_eq!(MAX_PAYLOAD + OVERHEAD, MAX_DATAGRAM);
+        assert_eq!(MAX_PAYLOAD, 1160);
+    }
+
+    #[test]
+    fn a_maximum_payload_still_fits_its_length_field() {
+        // `payload_len` is a u16, so this is not close — but a future MTU that
+        // did not fit would be a silent truncation rather than a refusal.
+        assert!(MAX_PAYLOAD <= u16::MAX as usize);
+    }
+
     use super::*;
 
     fn sample() -> Header {
