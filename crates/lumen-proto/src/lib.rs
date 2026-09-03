@@ -38,6 +38,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod audio;
 pub mod buf;
 pub mod crypto;
 pub mod error;
