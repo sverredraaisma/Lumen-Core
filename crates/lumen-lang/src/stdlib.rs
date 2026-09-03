@@ -36,26 +36,55 @@ struct Version {
 /// Every stdlib version this compiler carries.
 ///
 /// Adding a version means adding an entry; never changing one.
-static VERSIONS: &[Version] = &[Version {
-    number: 1,
-    files: &[
-        ("colour.lfx", include_str!("../../../stdlib/v1/colour.lfx")),
-        ("easing.lfx", include_str!("../../../stdlib/v1/easing.lfx")),
-        ("noise.lfx", include_str!("../../../stdlib/v1/noise.lfx")),
-        (
-            "palettes.lfx",
-            include_str!("../../../stdlib/v1/palettes.lfx"),
-        ),
-        ("random.lfx", include_str!("../../../stdlib/v1/random.lfx")),
-        ("shapes.lfx", include_str!("../../../stdlib/v1/shapes.lfx")),
-        ("space.lfx", include_str!("../../../stdlib/v1/space.lfx")),
-        (
-            "utility.lfx",
-            include_str!("../../../stdlib/v1/utility.lfx"),
-        ),
-        ("waves.lfx", include_str!("../../../stdlib/v1/waves.lfx")),
-    ],
-}];
+static VERSIONS: &[Version] = &[
+    Version {
+        number: 1,
+        files: &[
+            ("colour.lfx", include_str!("../../../stdlib/v1/colour.lfx")),
+            ("easing.lfx", include_str!("../../../stdlib/v1/easing.lfx")),
+            ("noise.lfx", include_str!("../../../stdlib/v1/noise.lfx")),
+            (
+                "palettes.lfx",
+                include_str!("../../../stdlib/v1/palettes.lfx"),
+            ),
+            ("random.lfx", include_str!("../../../stdlib/v1/random.lfx")),
+            ("shapes.lfx", include_str!("../../../stdlib/v1/shapes.lfx")),
+            ("space.lfx", include_str!("../../../stdlib/v1/space.lfx")),
+            (
+                "utility.lfx",
+                include_str!("../../../stdlib/v1/utility.lfx"),
+            ),
+            ("waves.lfx", include_str!("../../../stdlib/v1/waves.lfx")),
+        ],
+    },
+    Version {
+        number: 2,
+        // v1 verbatim, plus the capture group. A version is a whole library rather
+        // than a delta on the one before, which is what lets v1 keep compiling to
+        // byte-identical bytecode after v2 exists.
+        files: &[
+            (
+                "capture.lfx",
+                include_str!("../../../stdlib/v2/capture.lfx"),
+            ),
+            ("colour.lfx", include_str!("../../../stdlib/v2/colour.lfx")),
+            ("easing.lfx", include_str!("../../../stdlib/v2/easing.lfx")),
+            ("noise.lfx", include_str!("../../../stdlib/v2/noise.lfx")),
+            (
+                "palettes.lfx",
+                include_str!("../../../stdlib/v2/palettes.lfx"),
+            ),
+            ("random.lfx", include_str!("../../../stdlib/v2/random.lfx")),
+            ("shapes.lfx", include_str!("../../../stdlib/v2/shapes.lfx")),
+            ("space.lfx", include_str!("../../../stdlib/v2/space.lfx")),
+            (
+                "utility.lfx",
+                include_str!("../../../stdlib/v2/utility.lfx"),
+            ),
+            ("waves.lfx", include_str!("../../../stdlib/v2/waves.lfx")),
+        ],
+    },
+];
 
 /// The versions this compiler can compile against, lowest first.
 pub fn available() -> Vec<StdlibVersion> {
@@ -155,12 +184,51 @@ mod tests {
     #[test]
     fn version_one_is_available_and_parses() {
         assert!(has(StdlibVersion(1)));
-        assert_eq!(available(), alloc::vec![StdlibVersion(1)]);
+        // That v1 is *present and first*, not that it is the only one. Written
+        // as an equality against the whole list this failed the moment v2 was
+        // added, which is a test breaking on the one thing versions exist to
+        // make safe.
+        assert_eq!(available().first(), Some(&StdlibVersion(1)));
 
         let mut diags = Diagnostics::new();
         let lib = load(StdlibVersion(1), &mut diags).expect("stdlib v1 must parse");
         assert!(!diags.has_errors(), "{:?}", diags.items);
         assert!(!lib.fns.is_empty(), "stdlib v1 declares no functions");
+    }
+
+    #[test]
+    fn a_later_version_carries_everything_an_earlier_one_did() {
+        // The promise versioning makes: an effect written against v1 can move to
+        // v2 by changing one line, because v2 is v1 plus additions rather than a
+        // separate library that happens to share a name. Checked over every
+        // adjacent pair, so it keeps holding as versions are added.
+        let versions = available();
+        for pair in versions.windows(2) {
+            let (earlier, later) = (pair[0], pair[1]);
+            let mut diags = Diagnostics::new();
+            let a = load(earlier, &mut diags).expect("earlier version loads");
+            let b = load(later, &mut diags).expect("later version loads");
+            assert!(!diags.has_errors(), "{:?}", diags.items);
+
+            for f in &a.fns {
+                assert!(
+                    b.fns.iter().any(|g| g.name == f.name),
+                    "v{} dropped `{}`, which v{} declared",
+                    later.0,
+                    f.name,
+                    earlier.0
+                );
+            }
+            for p in &a.palettes {
+                assert!(
+                    b.palettes.iter().any(|q| q.name == p.name),
+                    "v{} dropped palette `{}`, which v{} declared",
+                    later.0,
+                    p.name,
+                    earlier.0
+                );
+            }
+        }
     }
 
     #[test]

@@ -84,9 +84,18 @@ fn an_unknown_stdlib_version_is_reported_by_the_resolver_too() {
         .iter()
         .find(|(m, _)| m == "this compiler does not have stdlib version 99")
         .unwrap_or_else(|| panic!("{ds:?}"));
+    // Built from what the compiler actually carries rather than written out.
+    // Spelled as a literal this failed the moment a second version was added,
+    // which is a test asserting the version list instead of the help text it is
+    // about.
+    let carried = lumen_lang::stdlib::available()
+        .iter()
+        .map(|v| v.0.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     assert_eq!(
         found.1,
-        "it carries 1; update the compiler, or lower the `stdlib` line"
+        format!("it carries {carried}; update the compiler, or lower the `stdlib` line")
     );
 }
 

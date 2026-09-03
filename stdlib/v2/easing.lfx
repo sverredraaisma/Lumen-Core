@@ -1,0 +1,49 @@
+lumen 1
+
+# Easing — stdlib v1
+#
+# Every easing function maps 0..1 to 0..1 and is monotone at the endpoints:
+# f(0) = 0 and f(1) = 1. Nothing here clamps its input, because clamping costs
+# an instruction on every call and the caller usually knows the value is already
+# in range. Reach for `remap_clamped` when it is not.
+#
+# There are no piecewise definitions. The pixel profile has no backward branches
+# and no data-dependent control flow, so the textbook multi-segment `bounce` is
+# not expressible; the versions here are continuous approximations chosen to
+# look right rather than to match a reference implementation term for term.
+fn ease_in(x : float) -> float {
+  return x * x
+}
+
+fn ease_out(x : float) -> float {
+  let k = 1 - x
+  return 1 - k * k
+}
+
+# Hermite, `3x² - 2x³`. This is exactly what the `smoothstep` instruction
+# computes, so it costs one instruction rather than the four an expansion would.
+fn ease_in_out(x : float) -> float {
+  return smoothstep(0, 1, x)
+}
+
+# A decaying oscillation rather than the classic four-segment parabola: the
+# segmented form needs branches the pixel profile does not have. |cos| over
+# 1.375 turns gives roughly three visible bounces, and the `1 - x` envelope
+# forces the last one to land exactly on 1.
+fn bounce(x : float) -> float {
+  let envelope = 1 - x
+  let swing = abs(cos01(x * 1.375))
+  return 1 - envelope * swing
+}
+
+# Overshoots and rings back. The exponential decay makes the tail settle within
+# Q16 resolution well before x reaches 1, so the endpoint is exact in practice.
+fn elastic(x : float) -> float {
+  return 1 - exp(0 - 6 * x) * cos01(x * 3)
+}
+
+# Anticipation: dips below zero before moving. The 1.70158 is the standard
+# overshoot constant, chosen so that f(1) = 1 exactly.
+fn back(x : float) -> float {
+  return x * x * (2.70158 * x - 1.70158)
+}

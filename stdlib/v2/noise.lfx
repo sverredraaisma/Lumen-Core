@@ -1,0 +1,89 @@
+lumen 1
+
+# Noise — stdlib v1
+#
+# Layered noise built on the core `noise1`, `noise2` and `noise3` instructions,
+# which are value noise on a hashed integer lattice, returning 0..1 and stable
+# for the life of the language.
+#
+# **The octave count is baked into the function name, not passed as an
+# argument.** The pixel profile has no loops, and `fn` has no compile-time
+# constant arguments, so `fbm(p, 5)` cannot exist: an octave count that varies
+# would need a backward branch. Four octaves is the shape most effects want and
+# the only one v1 ships; a v2 may add `fbm3_6` if anyone genuinely needs it.
+#
+# Cost is the thing to watch here. `noise3` is 28 instruction units and `noise2`
+# is 18, so a four-octave `fbm3` is over 112 before any of the scaling, which is
+# more than most of the examples spend in total. Gate it behind a `mask` where
+# the value is only needed in part of the room, and check the budget report
+# before reaching for `curl` or `voronoi` at all.
+# Fractal Brownian motion, four octaves, lacunarity 2 and gain 0.5.
+# Normalised by 1/1.875 so the result stays in 0..1.
+fn fbm2(px : float, py : float) -> float {
+  let a = noise2(px, py)
+  let b = noise2(px * 2, py * 2) * 0.5
+  let c = noise2(px * 4, py * 4) * 0.25
+  let d = noise2(px * 8, py * 8) * 0.125
+  return (a + b + c + d) * 0.533333
+}
+
+fn fbm3(px : float, py : float, pz : float) -> float {
+  let a = noise3(px, py, pz)
+  let b = noise3(px * 2, py * 2, pz * 2) * 0.5
+  let c = noise3(px * 4, py * 4, pz * 4) * 0.25
+  let d = noise3(px * 8, py * 8, pz * 8) * 0.125
+  return (a + b + c + d) * 0.533333
+}
+
+# The absolute value of signed noise, summed. Creases where the field crosses
+# zero read as billows — smoke and flame rather than cloud.
+fn turbulence(px : float, py : float, pz : float) -> float {
+  let a = abs(noise3(px, py, pz) * 2 - 1)
+  let b = abs(noise3(px * 2, py * 2, pz * 2) * 2 - 1) * 0.5
+  let c = abs(noise3(px * 4, py * 4, pz * 4) * 2 - 1) * 0.25
+  let d = abs(noise3(px * 8, py * 8, pz * 8) * 2 - 1) * 0.125
+  return (a + b + c + d) * 0.533333
+}
+
+# Turbulence inverted and squared: sharp bright ridges on a dark field. The
+# classic terrain generator, and the cheapest convincing lightning or crack.
+fn ridged(px : float, py : float, pz : float) -> float {
+  let a = 1 - abs(noise3(px, py, pz) * 2 - 1)
+  let b = 1 - abs(noise3(px * 2, py * 2, pz * 2) * 2 - 1)
+  let r = a * a * 0.666667 + b * b * 0.333333
+  return r
+}
+
+# Curl of a noise field, by central differences with a fixed epsilon of 0.05 m.
+# Divergence-free, so advecting along it looks like fluid rather than like
+# everything drifting the same way.
+#
+# Six `noise3` calls, 225 instruction units per pixel. This is by a wide margin
+# the most expensive thing in the standard library — more than twice what any
+# example in the cookbook spends in total — so check the budget report before
+# reaching for it.
+#
+# The `* 10` normalisation lives inside each binding rather than on the returned
+# vector, which looks arbitrary and is not: scaling the `vec3` afterwards needs
+# three more simultaneous registers than the allocator has left, and the function
+# stops compiling.
+fn curl(px : float, py : float, pz : float) -> vec3 {
+  let dx = (noise3(px + 0.05, py, pz) - noise3(px - 0.05, py, pz)) * 10
+  let dy = (noise3(px, py + 0.05, pz) - noise3(px, py - 0.05, pz)) * 10
+  let dz = (noise3(px, py, pz + 0.05) - noise3(px, py, pz - 0.05)) * 10
+  return vec3(dy - dz, dz - dx, dx - dy)
+}
+
+# `voronoi` is **not in v1.** The grammar names it and it is not here, which is
+# a deliberate absence rather than an oversight.
+#
+# A cell-search voronoi has to test the 3x3 neighbourhood of jittered feature
+# points, and with no loops that is nine unrolled cells. Measured on the current
+# compiler: two cells compile at 135 instruction units per pixel, four do not
+# compile at all — the register file runs out before the search does. Shipping a
+# two-cell version would not be a voronoi, and shipping a nine-cell version that
+# no effect can call would be worse than shipping nothing.
+#
+# It needs either a smarter register allocator or a `VORONOI` instruction. Until
+# one of those exists, `fbm2` with a `quantize` gives cellular-looking structure
+# for a fraction of the cost.

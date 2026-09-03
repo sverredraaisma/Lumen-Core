@@ -1,0 +1,117 @@
+lumen 1
+
+# Capture — stdlib v1
+#
+# Patterns the phone films to work out where every LED physically is.
+#
+# These are ordinary effects on purpose. A capture pattern is a pure function of
+# LED index and time, so AR mapping needs **no protocol messages of its own**:
+# the app pushes a high-priority source with an expiry like anything else, and a
+# mapping session that crashes cannot leave the lights blinking.
+#
+# The decoder that reads these back lives in the phone app. If you change the
+# framing here, that decoder is what breaks, and it will break silently — it will
+# simply stop identifying LEDs.
+
+# Two to the power of a whole number, exactly.
+#
+# `pow(2, k)` would be the obvious way and it is the wrong one. `POW` is
+# table-driven and approximate, and every use of a power of two below divides an
+# integer by it — which lands the result exactly on a bucket boundary, the one
+# place where an approximation of any size changes the answer. Built by
+# summation instead, because doubling is exact in Q16 and so is a sum of exact
+# powers.
+#
+# `1 + 1 + 2 + 4 + ... + 2^(k-1)` is `2^k`, so each `step` adds the next term
+# once `k` has reached it. Covers `k` in 0..12, which is 4096 LEDs on one
+# device; above that it saturates rather than wrapping, and a caller that needs
+# more has outgrown a single strip.
+# Written as one expression rather than a chain of `let` bindings, which is not
+# a style choice. An inlined function's `let` holds a register for the life of
+# the program, so a twelve-step ladder written as twelve bindings costs twelve
+# registers and leaves nothing for the caller - measured at exactly 32 of 32,
+# failing the moment anything used it. Scratch *is* reused within a single
+# expression, and the same ladder written this way costs 25 registers total,
+# caller included.
+fn pow2(k : float) -> float {
+  return 1 + step(1, k) + step(2, k) * 2 + step(3, k) * 4 + step(4, k) * 8 + step(5, k) * 16 + step(6, k) * 32 + step(7, k) * 64 + step(8, k) * 128 + step(9, k) * 256 + step(10, k) * 512 + step(11, k) * 1024 + step(12, k) * 2048
+}
+
+# Bit `k` of a whole number, as 0 or 1. Bit 0 is the least significant.
+#
+# Exact for `v` up to 65535 and `k` up to 15: dividing by a power of two in Q16
+# is a shift, so nothing is lost on the way to the `fract`.
+fn bit(v : float, k : float) -> float {
+  return floor(fract(v / pow2(k + 1)) * 2)
+}
+
+# Which bit of the frame is being transmitted at time `t`, at `rate` bits per
+# second.
+fn code_index(t : float, rate : float) -> float {
+  return floor(t * rate)
+}
+
+# Position within the current bit, 0..1.
+fn code_phase(t : float, rate : float) -> float {
+  return fract(t * rate)
+}
+
+# How many bits one frame takes: four sync, one start, then the index.
+fn code_length(bits : float) -> float {
+  return 5 + bits
+}
+
+# One bit of the frame an LED transmits: `1 1 1 1 0`, then the index, least
+# significant bit first.
+#
+# The four ones and a zero are a start delimiter. It is what lets the phone find
+# the beginning of a frame in video it started recording at an arbitrary moment,
+# without knowing the mesh clock — which is the whole point of encoding this way
+# rather than counting from a synchronised instant.
+#
+# **There is no checksum, deliberately.** The obvious parity bit costs more than
+# it is worth here: computing it needs every index bit, each of which inlines its
+# own power-of-two ladder, and the pixel profile has no loop to share them
+# between. It came to several hundred instructions for one bit of protection.
+#
+# The LED transmits continuously and the phone films it for as long as it likes,
+# so the check that costs nothing is **agreement between consecutive frames**.
+# That also catches the errors a parity bit misses — a frame decoded at the wrong
+# alignment usually decodes differently next time — and it is the same quantity
+# the mapper wants anyway, since a per-LED confidence is what tells a user which
+# LEDs are worth re-scanning.
+fn code_bit(index : float, bits : float, k : float) -> float {
+  let in_sync = 1 - step(4, k)
+  let in_index = step(5, k) * (1 - step(5 + bits, k))
+  return in_sync + in_index * bit(index, k - 5)
+}
+
+# The start bit needs no term: it is the one position that is neither sync nor
+# index, so both terms are zero there and the frame carries its zero for free.
+
+# The brightness an LED shows while transmitting its own index, Manchester
+# encoded.
+#
+# Manchester means every bit carries a transition in its middle: a one is high
+# then low, a zero is low then high. Two consequences, both of which the phone
+# depends on. The signal is **self-clocking**, so the decoder recovers the bit
+# rate from the video and never needs the mesh clock — sync then improves
+# accuracy instead of being a hard dependency. And it is **DC balanced**, so
+# every LED is lit exactly half the time regardless of its index, which keeps a
+# camera's auto-exposure from hunting between a dark strip and a bright one.
+#
+# `bits` is how many index bits to send: 9 covers 512 LEDs, 12 covers 4096. Send
+# no more than needed, because frame time is what a user experiences as how long
+# mapping takes.
+#
+# Pick `rate` against the camera, not against how fast the LED can blink. A
+# decoder needs several samples per half-bit, so at 30 fps a rate above about 6
+# leaves too little to find the mid-bit transition in.
+fn code_level(index : float, bits : float, t : float, rate : float) -> float {
+  let k = code_index(t, rate)
+  let phase = code_phase(t, rate)
+  let b = code_bit(index, bits, k)
+  return select(step(0.5, phase), 1 - b, b)
+}
+
+# First half of the bit period carries the bit, second half its complement.

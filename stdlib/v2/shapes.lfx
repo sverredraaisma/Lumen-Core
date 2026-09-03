@@ -1,0 +1,59 @@
+lumen 1
+
+# Shapes — stdlib v1
+#
+# Signed distance fields, in metres, matching the world coordinates an effect
+# reads from `x, y, z`. Negative inside, zero on the surface, positive outside.
+#
+# **Points are passed as loose components, not as a `vec3`.** The core takes
+# `length(x, y, z)` rather than `length(v)`, and a field access to unpack a
+# vector costs a move each — so a signed distance function that took a vector
+# would spend most of its instructions taking it apart again. Call these with
+# `sphere_sdf(x, y, z, 0.4)` and let the hoisting pass worry about the rest.
+#
+# A distance is a *number*, which is the point: subtracting two fields
+# intersects them, taking the min unions them, and a `smoothstep` over the
+# result turns any of it into a soft edge with a thickness you can put on a
+# slider.
+fn sphere_sdf(px : float, py : float, pz : float, radius : float) -> float {
+  return length(px, py, pz) - radius
+}
+
+# Half-extents, so `box_sdf(x, y, z, 0.5, 0.5, 0.5)` is a 1 m cube on the origin.
+#
+# This is the **Chebyshev** form: exact inside the box and along every face, and
+# an under-estimate near an outside corner, where it reports the distance to the
+# nearest face plane rather than to the corner itself. The Euclidean form needs a
+# `length` of three clamped components on top of six parameters, which does not
+# fit in 32 registers — measured, not assumed. For lighting the difference shows
+# only as a slightly rounder falloff at the corners of a soft-edged box, which is
+# usually invisible and occasionally an improvement.
+fn box_sdf(px : float, py : float, pz : float, hx : float, hy : float, hz : float) -> float {
+  let dx = abs(px) - hx
+  let dy = abs(py) - hy
+  let dz = abs(pz) - hz
+  return max(dx, max(dy, dz))
+}
+
+# `n` must be a unit vector; `offset` slides the plane along it. The dot product
+# is written out because the core `dot` is a scalar multiply, not a vector
+# reduction — see the stdlib README.
+fn plane_sdf(px : float, py : float, pz : float, nx : float, ny : float, nz : float, offset : float) -> float {
+  return px * nx + py * ny + pz * nz - offset
+}
+
+# Capped cylinder about the Y axis: `radius` across, `half_height` up and down.
+# Y is up in room coordinates, which makes this the shape for a pillar or a
+# column of light around a person.
+fn cylinder_sdf(px : float, py : float, pz : float, radius : float, half_height : float) -> float {
+  let dr = length(px, pz) - radius
+  let dy = abs(py) - half_height
+  return min(max(dr, dy), 0) + length(max(dr, 0), max(dy, 0))
+}
+
+# A ring in the XZ plane. `major` is the radius of the ring, `minor` its
+# thickness — a halo over a table is `torus_sdf(x, y - 2.1, z, 0.6, 0.05)`.
+fn torus_sdf(px : float, py : float, pz : float, major : float, minor : float) -> float {
+  let q = length(px, pz) - major
+  return length(q, py) - minor
+}

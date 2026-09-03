@@ -1,0 +1,61 @@
+lumen 1
+
+# Colour — stdlib v1
+#
+# **Every colour in the language is linear.** An effect never applies gamma and
+# never sees a gamma-encoded value; firmware encodes once, at the end. Nothing
+# here breaks that, and a function that did would make every fade in the system
+# look cheap.
+#
+# `hue_shift` rotates a *hue*, not a colour, and that is not laziness — a
+# colour-in, colour-out hue rotation cannot be written in v1. Two things stop it.
+# The VM has an `RGB2HSV` instruction but only the `hsv` constructor is reachable
+# from source, so there is no round trip; and a matrix rotation in YIQ needs more
+# simultaneous values than the register allocator can give a function that
+# already spends three registers on its colour argument and three on its result.
+# Measured: such a function compiles with one `let` and fails with two.
+#
+# So shift the hue before the colour exists — `hsv(hue_shift(h, by), s, v)` —
+# which is cheaper anyway, and is what the vendored copy in `lumen-core` already
+# does.
+# Rotate hue by `turns`, leaving luminance alone. Saturated colours survive this
+# well; near-greys drift, because their hue is barely defined to begin with.
+fn hue_shift(h : float, by : float) -> float {
+  return fract(h + by)
+}
+
+# `amount` 0 is greyscale, 1 leaves the colour alone, above 1 pushes past it.
+# The luma weights are Rec. 709, which is the right set for linear light.
+fn saturate(c : color, amount : float) -> color {
+  let l = c.r * 0.2126 + c.g * 0.7152 + c.b * 0.0722
+  return rgb(l + (c.r - l) * amount, l + (c.g - l) * amount, l + (c.b - l) * amount)
+}
+
+# Contrast about mid-grey. Note that mid-grey in *linear* light is 0.216, not
+# 0.5 — pivoting on 0.5 here would darken everything, which is the mistake this
+# function exists to stop people making by hand.
+fn contrast(c : color, amount : float) -> color {
+  return rgb((c.r - 0.216) * amount + 0.216, (c.g - 0.216) * amount + 0.216, (c.b - 0.216) * amount + 0.216)
+}
+
+# Dim by a *perceived* fraction rather than a linear one.
+#
+# Multiplying linear light by 0.5 does not look half as bright; it looks about
+# 73% as bright. Squaring the level approximates the sRGB transfer function
+# closely enough that a fade to zero reads as even, which is what a dimmer
+# slider has to do. The name says "gamma free" because the correction happens
+# on the *scalar*, never on the colour — the colour stays linear throughout.
+fn gamma_free_dim(c : color, level : float) -> color {
+  let k = level * level
+  return c * k
+}
+
+# White by colour temperature. `k` is in kelvin, roughly 1000..12000, and
+# `intensity` scales the result.
+#
+# A thin name over the core `temp` instruction, and worth having: an effect that
+# reads `kelvin(2700, level)` says what it means, where `temp(2700, level)` reads
+# like something to do with the weather.
+fn kelvin(k : float, intensity : float) -> color {
+  return temp(k, intensity)
+}

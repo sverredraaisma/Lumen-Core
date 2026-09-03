@@ -1,0 +1,36 @@
+lumen 1
+
+# Random — stdlib v1
+#
+# **Nothing here holds state.** Every function is a pure hash of its arguments,
+# so it gives the same answer on every device in the mesh and the same answer
+# every frame for the same input. That is the only way a random-looking effect
+# can stay in sync across devices that never talk to each other about it, and it
+# is why the language offers no `random()` at all.
+#
+# To make a value change over time, hash something that includes time —
+# `hash1(floor(t * 8) + i)` re-rolls eight times a second and is identical
+# everywhere. To make it change per LED, include `i`.
+#
+# **The constants are deliberately small.** The textbook one-liner multiplies a
+# sine by 43758.5453, which overflows Q16.16 an order of magnitude before it gets
+# there. Everything below stays inside ±128 so the intermediate never saturates,
+# and the resulting distribution was chosen to still look flat at LED counts.
+fn hash1(v : float) -> float {
+  return fract(sin01(v * 12.9898) * 137.51)
+}
+
+fn hash2(vx : float, vy : float) -> float {
+  return fract(sin01(vx * 12.9898 + vy * 7.233) * 137.51)
+}
+
+fn hash3(vx : float, vy : float, vz : float) -> float {
+  return fract(sin01(vx * 12.9898 + vy * 7.233 + vz * 3.719) * 137.51)
+}
+
+# A stable 0..1 value per LED. Constant for the life of the effect, identical on
+# every device, and the right way to give each pixel its own offset, its own
+# twinkle phase, or its own sparkle threshold.
+fn rand_per_pixel() -> float {
+  return fract(sin01(i * 12.9898 + 0.618034) * 137.51)
+}
