@@ -144,12 +144,23 @@ pub enum OpCode {
     /// End this section.
     Halt = 0x75,
 
-    // --- 0x8_ arrays (sim profile only) ------------------------------------
+    // --- 0x8_ arrays -------------------------------------------------------
     /// `a = array[b][c]`, bounds-checked.
+    ///
+    /// Legal in **both** profiles. A sim accessor is a bounded accumulation
+    /// running per pixel over the broadcast simulation state, so the pixel
+    /// kernel has to be able to read it. Writing it, and asking how long it is,
+    /// remain the sim master's alone.
     ALoad = 0x80,
-    /// `array[a][b] = c`, bounds-checked.
+    /// `array[a][b] = c`, bounds-checked. Sim profile only.
+    ///
+    /// Three hundred LEDs on forty devices all writing one array would need an
+    /// ordering rule the sans-IO design deliberately does not have.
     AStore = 0x81,
-    /// `a = len(array[b])`
+    /// `a = len(array[b])`. Sim profile only.
+    ///
+    /// A trip count discovered at run time could not be costed before the
+    /// program was published, and an exact budget is the point.
     ALen = 0x82,
 
     // --- 0x9_ debug (probe builds only) ------------------------------------
@@ -247,8 +258,14 @@ impl OpCode {
     /// Checked at load rather than at execution: a `sim` program reaching the
     /// per-pixel path would blow the budget three hundred times a frame, and
     /// finding that out per-pixel is far too late.
+    /// Whether this instruction may appear only in a `sim` program.
+    ///
+    /// `ALoad` is deliberately absent: a pixel kernel reads the broadcast sim
+    /// state to evaluate an accessor. It still cannot write it (`AStore`) or ask
+    /// its length (`ALen`), which is what keeps shared state single-writer and
+    /// keeps a per-pixel accumulation's cost known before it ships.
     pub const fn is_sim_only(self) -> bool {
-        matches!(self, OpCode::ALoad | OpCode::AStore | OpCode::ALen)
+        matches!(self, OpCode::AStore | OpCode::ALen)
     }
 
     /// Estimated cost in budget units.
@@ -481,11 +498,19 @@ mod tests {
     }
 
     #[test]
-    fn only_the_array_family_is_sim_only() {
+    fn only_writing_and_measuring_an_array_is_sim_only() {
+        // `ALoad` is the exception and the reason this test is worth having: a
+        // pixel kernel reads the broadcast sim state to evaluate an accessor,
+        // and quietly adding it back to this set would make every effect that
+        // uses one refuse to load with no diagnostic pointing here.
         for &op in ALL {
-            let expect = matches!(op, OpCode::ALoad | OpCode::AStore | OpCode::ALen);
+            let expect = matches!(op, OpCode::AStore | OpCode::ALen);
             assert_eq!(op.is_sim_only(), expect, "{op:?}");
         }
+        assert!(
+            !OpCode::ALoad.is_sim_only(),
+            "a pixel kernel may read an array"
+        );
     }
 
     #[test]

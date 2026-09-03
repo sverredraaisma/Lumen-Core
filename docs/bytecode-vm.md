@@ -102,12 +102,25 @@ The per-pixel kernel and a shared simulation need different machines. One instru
 |---|---|---|
 | Runs on | every device with `render` | the sim master only |
 | Invocation | once per LED per frame | once per frame |
-| Memory | registers plus the `prev` buffer | registers plus **bounded arrays** declared at compile time |
+| Memory | registers, the `prev` buffer, and **read-only** access to the broadcast sim arrays | registers plus **bounded arrays** declared at compile time |
 | Control flow | no backward branches; `REPEAT` with compile-time trip count | bounded loops over declared arrays, still with a static iteration ceiling |
 | Output | pixel colour | a state blob broadcast as a CHAN channel |
 | Budget | instructions/pixel × LEDs × fps | instructions × fps, checked against the sim master's capacity |
 
-Extra instructions the `sim` profile adds: array load/store with a bounds-checked index, an array-length constant, and `FOREACH` over a declared array. Nothing else — no allocation, no recursion, no unbounded anything.
+Extra instructions the `sim` profile adds: array store with a bounds-checked index, an array-length constant, and `FOREACH` over a declared array. Nothing else — no allocation, no recursion, no unbounded anything.
+
+### Why `ALOAD` is legal in both
+
+Array *load* is the one array instruction the `pixel` profile may use. Without it a sim accessor cannot exist: [[Effect Language Grammar#Sim accessors]] says accessors are green — they run per pixel on every device against its own coordinates, reading the broadcast state — and `influence` "compiles to a bounded accumulation with the falloff inlined", which has to read the elements to accumulate over them.
+
+The two alternatives were worse. Addressing the state through `CHREAD` needs a wider channel offset, since a `u8` reaches 256 bytes and sixty-four element positions alone are 768. Accumulating the field on the sim master and broadcasting the result avoids both changes and breaks the property the whole architecture rests on, because what crosses the network would then scale with LED count.
+
+`ASTORE` and `ALEN` stay sim-only, and that asymmetry is the point:
+
+- **No store** means a pixel kernel cannot mutate shared state. Three hundred LEDs on forty devices all writing the same array would need an ordering rule the sans-IO design deliberately does not have, and the result would depend on how the render loop happened to be scheduled.
+- **No length** means the trip count of an accumulation is a compile-time constant, so the instruction count stays static and the budget check remains exact. An accumulation whose length was discovered at run time could not be costed before it was published, which is the whole point of the budget.
+
+Loosening the loader is safe in the direction it goes: a device with this rule accepts every program the older rule accepted, so nothing already published stops working. The reverse — an old device meeting a program that reads an array in `pixel` — is what `vm_min_version` is for, and it reports the refusal by name.
 
 Keeping it in the same bytecode family rather than making sims native firmware code is what preserves the expandability promise: **a user can write a new simulation in [[Effect Language]] and ship it as an ordinary effect file**, with no firmware release and no privileged position for built-in sims.
 

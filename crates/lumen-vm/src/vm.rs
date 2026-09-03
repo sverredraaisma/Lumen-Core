@@ -376,8 +376,30 @@ impl Machine {
         inputs: &PixelInputs,
         uniforms: &mut U,
     ) -> Result<PixelOutput, Fault> {
+        self.run_pixel_with(program, inputs, uniforms, &mut NoArrays)
+    }
+
+    /// [`Machine::run_pixel`], with the broadcast simulation state available to
+    /// read.
+    ///
+    /// A sim accessor is a bounded accumulation over that state, running per
+    /// pixel on every device against its own coordinates — so the kernel needs
+    /// the array, and `ALOAD` is legal in this profile for exactly that. It
+    /// still cannot write it: the shell hands over what it last received, and
+    /// nothing here can change it.
+    ///
+    /// A separate entry point rather than a parameter on `run_pixel`, because a
+    /// device rendering an effect with no sim in it should not have to name an
+    /// array type it does not have.
+    pub fn run_pixel_with<U: Uniforms, A: Arrays>(
+        &mut self,
+        program: &Program<'_>,
+        inputs: &PixelInputs,
+        uniforms: &mut U,
+        arrays: &mut A,
+    ) -> Result<PixelOutput, Fault> {
         self.load_inputs(inputs);
-        self.execute(program, Section::Pixel, uniforms, &mut NoArrays)
+        self.execute(program, Section::Pixel, uniforms, arrays)
     }
 
     /// Run a `sim` program's `frame` section against its array bank.

@@ -145,14 +145,32 @@ fn an_unimplemented_instruction_is_caught_at_load_not_per_pixel() {
 
 #[test]
 fn a_sim_instruction_in_a_pixel_program_is_refused_at_load() {
+    // Writing shared state from a pixel kernel is the one that has to stay
+    // refused: three hundred LEDs on forty devices all storing into one array
+    // would need an ordering rule the sans-IO design does not have.
+    for op in [OpCode::AStore, OpCode::ALen] {
+        let bytes = pixel_program(|b| {
+            b.push(Section::Pixel, Instruction::new(op, 0, 0, 0));
+        });
+        assert_eq!(
+            Program::parse(&bytes),
+            Err(ProgramError::SimInstructionInPixelProfile(op.to_u8())),
+            "{op:?} must not load in a pixel program"
+        );
+    }
+}
+
+#[test]
+fn a_pixel_program_may_read_an_array() {
+    // The loosening that makes sim accessors possible at all. An accessor is a
+    // bounded accumulation running per pixel over the broadcast simulation
+    // state, so the kernel has to be able to read it.
     let bytes = pixel_program(|b| {
-        b.push(Section::Pixel, Instruction::new(OpCode::ALoad, 0, 0, 0));
+        b.push(Section::Pixel, Instruction::new(OpCode::ALoad, 16, 0, 0));
     });
-    assert_eq!(
-        Program::parse(&bytes),
-        Err(ProgramError::SimInstructionInPixelProfile(
-            OpCode::ALoad.to_u8()
-        ))
+    assert!(
+        Program::parse(&bytes).is_ok(),
+        "ALOAD is legal in the pixel profile"
     );
 }
 
@@ -1366,4 +1384,130 @@ fn a_trail_decays_over_frames_with_no_state_declared() {
     for pair in seen.windows(2) {
         assert!(pair[1] < pair[0], "the trail stopped decaying: {seen:?}");
     }
+}
+
+/// A pixel kernel reading the broadcast simulation state.
+///
+/// This is the whole point of `ALOAD` being legal in the `pixel` profile: a sim
+/// accessor is a bounded accumulation over the elements, running per pixel on
+/// every device against its own coordinates. Without this the accessors in
+/// `lumen-lang` cannot be compiled at all, and the three alternatives all cost
+/// something the architecture is not willing to spend.
+#[test]
+fn a_pixel_kernel_can_accumulate_over_broadcast_sim_state() {
+    // Sum four elements and emit the total on every channel — the shape of
+    // `influence` with the falloff removed.
+    let bytes = pixel_program(|b| {
+        let zero = b.constant(Q16::ZERO);
+        b.push(
+            Section::Pixel,
+            Instruction::with_imm(OpCode::LoadK, 20, zero),
+        );
+        for i in 0..4u8 {
+            let idx = b.constant(Q16::from_int(i as i16));
+            b.push(
+                Section::Pixel,
+                Instruction::with_imm(OpCode::LoadK, 21, idx),
+            );
+            // r22 = array[0][r21]
+            b.push(Section::Pixel, Instruction::new(OpCode::ALoad, 22, 0, 21));
+            b.push(Section::Pixel, Instruction::new(OpCode::Add, 20, 20, 22));
+        }
+        b.push(
+            Section::Pixel,
+            Instruction::new(OpCode::EmitRgb, 20, 20, 20),
+        );
+    });
+    let program = Program::parse(&bytes).expect("a pixel program may read an array");
+
+    let mut storage = [
+        Q16::from_int(1),
+        Q16::from_int(2),
+        Q16::from_int(3),
+        Q16::from_int(4),
+    ];
+    let layout = [(0usize, 4usize)];
+    let mut arrays = SliceArrays::new(&mut storage, &layout).expect("layout");
+
+    let mut m = Machine::new();
+    let out = m
+        .run_pixel_with(
+            &program,
+            &PixelInputs::default(),
+            &mut NoUniforms,
+            &mut arrays,
+        )
+        .expect("run");
+    assert_eq!(
+        out,
+        PixelOutput::Rgb {
+            r: Q16::from_int(10),
+            g: Q16::from_int(10),
+            b: Q16::from_int(10),
+        },
+        "1 + 2 + 3 + 4"
+    );
+}
+
+#[test]
+fn a_pixel_kernel_reading_past_the_end_of_an_array_faults() {
+    // The index comes from a compiled program and the array from the network,
+    // so neither is trustworthy. A bounds check that only ran in the sim
+    // profile would leave the per-pixel path — the hot one, on every device —
+    // reading whatever followed in memory.
+    let bytes = pixel_program(|b| {
+        let idx = b.constant(Q16::from_int(9));
+        b.push(
+            Section::Pixel,
+            Instruction::with_imm(OpCode::LoadK, 21, idx),
+        );
+        b.push(Section::Pixel, Instruction::new(OpCode::ALoad, 22, 0, 21));
+        b.push(
+            Section::Pixel,
+            Instruction::new(OpCode::EmitRgb, 22, 22, 22),
+        );
+    });
+    let program = Program::parse(&bytes).expect("parse");
+
+    let mut storage = [Q16::ZERO; 4];
+    let layout = [(0usize, 4usize)];
+    let mut arrays = SliceArrays::new(&mut storage, &layout).expect("layout");
+
+    let mut m = Machine::new();
+    assert!(
+        m.run_pixel_with(
+            &program,
+            &PixelInputs::default(),
+            &mut NoUniforms,
+            &mut arrays
+        )
+        .is_err(),
+        "an out-of-range read must fault rather than return something"
+    );
+}
+
+#[test]
+fn a_pixel_kernel_with_no_arrays_at_all_faults_rather_than_reading_nothing() {
+    // What a device runs when it has an effect with an accessor but has not
+    // received any sim state yet. Answering zero would render a plausible
+    // frame built on data that never arrived.
+    let bytes = pixel_program(|b| {
+        let zero = b.constant(Q16::ZERO);
+        b.push(
+            Section::Pixel,
+            Instruction::with_imm(OpCode::LoadK, 21, zero),
+        );
+        b.push(Section::Pixel, Instruction::new(OpCode::ALoad, 22, 0, 21));
+        b.push(
+            Section::Pixel,
+            Instruction::new(OpCode::EmitRgb, 22, 22, 22),
+        );
+    });
+    let program = Program::parse(&bytes).expect("parse");
+    let mut m = Machine::new();
+    assert!(
+        m.run_pixel(&program, &PixelInputs::default(), &mut NoUniforms)
+            .is_err(),
+        "no arrays means no array to read"
+    );
 }
