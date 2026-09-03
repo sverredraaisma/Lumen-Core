@@ -93,8 +93,17 @@ pub fn load(version: StdlibVersion, diags: &mut Diagnostics) -> Option<Stdlib> {
         return None;
     };
 
+    collect(v.files, diags)
+}
+
+/// Parse a set of vendored files into a [`Stdlib`].
+///
+/// Split out from [`load`] so the packaging diagnostics — which no vendored
+/// version can trigger, and which would therefore first be seen by whoever
+/// re-vendors — are reachable from a test with a synthetic file list.
+fn collect(files: &[(&str, &str)], diags: &mut Diagnostics) -> Option<Stdlib> {
     let mut out = Stdlib::default();
-    for (name, src) in v.files {
+    for (name, src) in files {
         let (file, file_diags) = crate::parse(src);
         if file_diags.has_errors() {
             diags.push(Diagnostic::error(
@@ -172,6 +181,65 @@ mod tests {
         let e = diags.errors().next().unwrap();
         assert!(e.message.contains("99"), "{}", e.message);
         assert!(e.help.contains('1'), "{}", e.help);
+    }
+
+    #[test]
+    fn the_known_version_list_reads_as_a_sentence() {
+        // `describe` is what an author sees when their `stdlib` line is too
+        // new. One version must not read as "it carries 1," and several must
+        // not run together.
+        assert_eq!(describe(&[1]), "1");
+        assert_eq!(describe(&[1, 2, 7]), "1, 2, 7");
+        assert_eq!(describe(&[]), "");
+    }
+
+    #[test]
+    fn a_stdlib_file_that_does_not_parse_is_called_a_packaging_bug() {
+        // Nothing an author writes can reach this, so it is worth pinning:
+        // whoever re-vendors badly must be told it is not their effect.
+        let mut diags = Diagnostics::new();
+        assert!(collect(&[("broken.lfx", "not a lumen file at all\n")], &mut diags).is_none());
+        let e = diags.errors().next().expect("expected an error");
+        assert_eq!(
+            e.message,
+            "the vendored stdlib file `broken.lfx` does not parse"
+        );
+        assert_eq!(
+            e.help,
+            "this is a compiler packaging bug, not a problem with your effect; re-vendor the stdlib"
+        );
+    }
+
+    #[test]
+    fn a_stdlib_file_declaring_an_effect_is_refused_rather_than_ignored() {
+        // A `curve` or `effect` in the stdlib would parse and then do nothing,
+        // which is how a library ships something nobody can call.
+        let mut diags = Diagnostics::new();
+        let src = "lumen 1\neffect \"sneaky\" {\n  layer b { color = rgb(0,0,0) }\n}\n";
+        assert!(collect(&[("odd.lfx", src)], &mut diags).is_none());
+        let e = diags.errors().next().expect("expected an error");
+        assert_eq!(
+            e.message,
+            "the vendored stdlib file `odd.lfx` declares something other than a function or a palette"
+        );
+        assert_eq!(
+            e.help,
+            "the stdlib may only contain `fn` and `palette` declarations"
+        );
+    }
+
+    #[test]
+    fn collect_keeps_functions_and_palettes_in_file_order() {
+        // Declaration order reaches the bytecode, so it is part of the build.
+        let mut diags = Diagnostics::new();
+        let a = "lumen 1\nfn one() -> float {\n  return 1\n}\n";
+        let b = "lumen 1\npalette p {\n  0 #000000\n  1 #ffffff\n}\nfn two() -> float {\n  return 2\n}\n";
+        let lib = collect(&[("a.lfx", a), ("b.lfx", b)], &mut diags).expect("both files parse");
+        assert!(!diags.has_errors(), "{:?}", diags.items);
+        let names: alloc::vec::Vec<&str> = lib.fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, alloc::vec!["one", "two"]);
+        assert_eq!(lib.palettes.len(), 1);
+        assert_eq!(lib.palettes[0].name, "p");
     }
 
     #[test]

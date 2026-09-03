@@ -205,6 +205,22 @@ mod tests {
     }
 
     #[test]
+    fn a_warning_renders_as_a_warning_not_an_error() {
+        // The label is the only thing distinguishing the two in a terminal, so
+        // a warning that says "error" would make every build look broken.
+        let src = "let a = 1";
+        let w = Diagnostic::warning(Span::new(4, 5), "`a` is never read", "remove it");
+        let text = w.render(src);
+        assert!(text.starts_with("warning: `a` is never read"), "{text}");
+        assert!(!text.contains("error"), "{text}");
+        assert!(!w.is_error());
+
+        let e = Diagnostic::error(Span::new(4, 5), "`a` is never read", "remove it");
+        assert!(e.render(src).starts_with("error: `a` is never read"));
+        assert!(e.is_error());
+    }
+
+    #[test]
     fn a_zero_width_span_still_gets_a_caret() {
         // Spans at end-of-file are empty; a diagnostic with no visible marker
         // reads like a rendering bug.

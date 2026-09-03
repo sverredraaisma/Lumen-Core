@@ -849,4 +849,77 @@ mod tests {
             assert!(!tok.tok.describe().is_empty());
         }
     }
+
+    #[test]
+    fn describe_names_each_token_the_way_an_author_wrote_it() {
+        // `expected `)`, found `}`` is only useful if both halves are exact, so
+        // pin every description rather than only checking it is non-empty.
+        let cases: &[(&str, &str)] = &[
+            ("a", "an identifier"),
+            ("1", "a number"),
+            ("#ff0000", "a colour"),
+            ("\"s\"", "a string"),
+            ("{", "`{`"),
+            ("}", "`}`"),
+            ("(", "`(`"),
+            (")", "`)`"),
+            ("[", "`[`"),
+            ("]", "`]`"),
+            (",", "`,`"),
+            (":", "`:`"),
+            (".", "`.`"),
+            ("..", "`..`"),
+            ("=", "`=`"),
+            ("->", "`->`"),
+            ("+", "`+`"),
+            ("-", "`-`"),
+            ("*", "`*`"),
+            ("/", "`/`"),
+            ("%", "`%`"),
+            ("<", "`<`"),
+            ("<=", "`<=`"),
+            (">", "`>`"),
+            (">=", "`>=`"),
+            ("==", "`==`"),
+            ("!=", "`!=`"),
+            ("&&", "`&&`"),
+            ("||", "`||`"),
+            ("!", "`!`"),
+        ];
+        for (src, want) in cases {
+            let (t, e) = lex(src);
+            assert!(e.is_empty(), "{src}: {e:?}");
+            assert_eq!(t[0].tok.describe(), *want, "for source `{src}`");
+        }
+        assert_eq!(Tok::Newline.describe(), "end of line");
+        assert_eq!(Tok::Eof.describe(), "end of file");
+    }
+
+    #[test]
+    fn every_escape_the_help_line_promises_is_supported() {
+        // The unknown-escape diagnostic names \n, \t, \\ and \" — all four have
+        // to actually work, or the help line is a lie.
+        assert_eq!(
+            toks(r#""a\nb\tc\\d\"e""#),
+            vec![Tok::Str("a\nb\tc\\d\"e".into()), Tok::Newline, Tok::Eof]
+        );
+    }
+
+    #[test]
+    fn hex_digits_are_read_in_either_case() {
+        // `#FF8000` and `#ff8000` are the same colour; a case-sensitive reader
+        // would silently produce a different one.
+        assert_eq!(
+            toks("#FF8000"),
+            vec![Tok::HexColor([255, 128, 0, 255]), Tok::Newline, Tok::Eof]
+        );
+        assert_eq!(toks("#AbCdEf"), toks("#abcdef"));
+        assert_eq!(hex_val(b'0'), 0);
+        assert_eq!(hex_val(b'9'), 9);
+        assert_eq!(hex_val(b'f'), 15);
+        assert_eq!(hex_val(b'F'), 15);
+        // Callers screen with `is_ascii_hexdigit`, so this arm is a defensive
+        // default rather than a reachable path; pin it so it stays one.
+        assert_eq!(hex_val(b'z'), 0);
+    }
 }

@@ -94,6 +94,32 @@ impl Parser {
         false
     }
 
+    /// Turn the description of an identifier into a plausible example of one.
+    ///
+    /// Callers pass an article phrase — "a parameter name", "an array name" —
+    /// because it reads correctly in `expected {what}, found ...`. Interpolating
+    /// that same phrase into the help line does not: every identifier error in
+    /// the language used to end ``must be a name like `my_a parameter name` ``.
+    ///
+    /// Dropping the article and the redundant trailing "name" turns each phrase
+    /// into the identifier a person would actually have written there.
+    fn example_name(what: &str) -> String {
+        let bare = what
+            .strip_prefix("an ")
+            .or_else(|| what.strip_prefix("a "))
+            .unwrap_or(what);
+        // "a parameter name" -> "parameter", but "a name" stays "name".
+        let bare = match bare.strip_suffix(" name") {
+            Some(trimmed) if !trimmed.is_empty() => trimmed,
+            _ => bare,
+        };
+        let mut out = String::from("my_");
+        for ch in bare.chars() {
+            out.push(if ch == ' ' { '_' } else { ch });
+        }
+        out
+    }
+
     /// Consume an identifier, or report and return `None`.
     fn ident(&mut self, what: &str) -> Option<String> {
         match self.peek().clone() {
@@ -106,7 +132,7 @@ impl Parser {
                 self.error(
                     span,
                     alloc::format!("expected {what}, found {}", other.describe()),
-                    alloc::format!("{what} must be a name like `my_{what}`"),
+                    alloc::format!("{what} must be a name like `{}`", Self::example_name(what)),
                 );
                 None
             }
@@ -1344,4 +1370,95 @@ fn exp_series(x: f64) -> f64 {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_local_power_function_guards_its_domain() {
+        // `srgb_pow` is only ever called with a positive base, but the guard is
+        // what keeps a future caller out of `ln(0)`. Nothing above can reach it,
+        // so pin it here.
+        assert_eq!(srgb_pow(0.0, 2.4), 0.0);
+        assert_eq!(srgb_pow(-1.0, 2.4), 0.0);
+    }
+
+    #[test]
+    fn the_local_power_function_agrees_with_known_values() {
+        // No dependency, no libm: if this drifts, every hex colour in every
+        // effect shifts with it.
+        assert!((srgb_pow(1.0, 2.4) - 1.0).abs() < 1e-9);
+        assert!((srgb_pow(4.0, 0.5) - 2.0).abs() < 1e-6);
+        assert!((srgb_pow(0.5, 2.0) - 0.25).abs() < 1e-6);
+        assert!((srgb_pow(0.1, 2.4) - 0.003_981_071_705).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_example_name_is_an_identifier_a_person_could_have_typed() {
+        // Every call site passes an article phrase, because that is what reads
+        // correctly in "expected {what}, found ...". The help line needs the
+        // same thing as an identifier instead.
+        assert_eq!(Parser::example_name("a parameter name"), "my_parameter");
+        assert_eq!(Parser::example_name("an argument name"), "my_argument");
+        assert_eq!(Parser::example_name("a capability"), "my_capability");
+        assert_eq!(Parser::example_name("a device class"), "my_device_class");
+        assert_eq!(
+            Parser::example_name("an assignment target"),
+            "my_assignment_target"
+        );
+        assert_eq!(Parser::example_name("a blend mode"), "my_blend_mode");
+    }
+
+    #[test]
+    fn a_bare_name_does_not_collapse_to_an_empty_example() {
+        // "a name" trims to "name", not to "", or the help line would read
+        // "must be a name like `my_`".
+        assert_eq!(Parser::example_name("a name"), "my_name");
+    }
+
+    #[test]
+    fn every_example_name_is_a_valid_identifier() {
+        // The help line claims the example is a name; if it is not lexable as
+        // one, the suggestion is worse than none.
+        for what in [
+            "a capability",
+            "a device class",
+            "a parameter name",
+            "a unit",
+            "a channel name",
+            "a channel type",
+            "a name",
+            "a state name",
+            "a layer name",
+            "a mask name",
+            "a blend mode",
+            "an assignment target",
+            "a field name",
+            "a sim name",
+            "an argument name",
+            "a loop variable",
+            "an array name",
+            "a function name",
+        ] {
+            let example = Parser::example_name(what);
+            assert!(!example.is_empty(), "{what} produced an empty example");
+            assert!(
+                example
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "{what} produced `{example}`, which is not an identifier"
+            );
+            let (toks, _, errs) = lex_with_comments(&example);
+            assert!(
+                errs.is_empty(),
+                "{what} produced `{example}`, which does not lex"
+            );
+            assert!(
+                matches!(&toks[0].tok, Tok::Ident(n) if *n == example),
+                "{what} produced `{example}`, which does not lex as a single identifier"
+            );
+        }
+    }
 }
