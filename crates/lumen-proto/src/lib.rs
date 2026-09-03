@@ -44,6 +44,7 @@ pub mod crypto;
 pub mod error;
 pub mod header;
 pub mod msg;
+pub mod reassembly;
 pub mod replay;
 
 pub use buf::{Reader, Writer};

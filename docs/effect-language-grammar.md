@@ -250,12 +250,42 @@ Warnings, all worth having early ([[Desktop Application#Debugging effects]]):
 
 - Should `fn` bodies declare their own `channel` requirements, propagating to callers? Convenient, but it makes bandwidth cost non-local. Allow it and surface the propagation in the editor.
 - Is `fps` advisory or binding? Advisory suits an effect that merely prefers a rate; binding would let an effect refuse to run below one. Advisory is probably right, since the frame grid already constrains the options.
-- **How does a sim accessor actually read the sim's elements?** This blocks `sim` entirely, and it is a contradiction rather than a gap. [[#Sim accessors]] says accessors are *green*: they run per pixel on every device, against its own coordinates, "reading the broadcast state as uniforms", and `influence` "compiles to a bounded accumulation with the falloff inlined". None of the three ways to do that works as the rest of the system currently stands:
-
-  - **Array opcodes.** `ALOAD`, `ASTORE` and `ALEN` are the only instructions marked sim-only, and [[Bytecode VM]] rejects a program that uses one in the `pixel` profile. A per-pixel accumulation over elements needs to read the array, so this is exactly what the profile rule forbids. Allowing reads in `pixel` is a change to a rule the ISA calls frozen.
-  - **Channel uniforms.** `CHREAD` addresses a channel with a `u8` offset, so it reaches 256 bytes. Sixty-four elements' positions alone are 768 bytes at `q16` precision. This needs a wider offset, which is a wire-format change, or a convention that splits one sim across several channels.
-  - **Precomputing on the sim master.** Broadcasting the accumulated field instead of the elements avoids both, and breaks the property the whole architecture rests on: nothing that depends on LED count crosses the network.
-
-  The three differ in what they cost and what they cost *permanently*, so this is a decision to make deliberately rather than the first one that compiles. Until it is made, `resolve` refuses `sim` blocks and `emit` refuses accessors — loudly, by name, which is the right failure: the grammar and the formatter both carry them, so a file that uses one is understood, kept and reformatted correctly, and only refused at the point where the answer would have to be invented.
-
 `budget n on <class>` is now settled as an optional declaration — it is what [[Effect Cookbook#This note is generated]] enforces in CI, and it lets a shared effect make a machine-checkable claim about what it costs. Ignored entirely for personal effects.
+
+### How a sim accessor reads the sim's elements
+
+**Settled: array reads are legal in the `pixel` profile; writes and length are not.**
+
+The question was which of three ways an accessor could reach the elements, and it
+was worth taking slowly because the options differ in what they cost permanently
+rather than in what they cost to write.
+
+- **Channel uniforms** were rejected. `CHREAD` addresses a channel with a `u8`
+  offset and so reaches 256 bytes, where sixty-four elements' positions alone are
+  768 bytes at `q16`. Widening it is a wire-format change, and splitting one sim
+  across several channels would make a device's channel budget depend on how a
+  simulation happens to be written.
+- **Precomputing the field on the sim master** was rejected outright. It works,
+  and it breaks the property the whole architecture rests on: what crosses the
+  network would then depend on LED count.
+- **Array opcodes** were taken, with the smallest change that makes them work.
+  `ALOAD` is no longer sim-only, so a pixel kernel may read the broadcast state.
+  `ASTORE` and `ALEN` remain sim-only.
+
+Splitting the three array instructions rather than moving all of them is what
+keeps this cheap. Only the *sim master* writes, so shared state stays
+single-writer with no coordination anywhere. And `ALEN` staying out matters more
+than it looks: a per-pixel loop whose trip count came from the array at run time
+could not be costed at compile time, and the budget check would stop being exact.
+Element count is a compile-time constant, so an accumulation over it unrolls to a
+known number of instructions and the compiler can still promise a frame rate.
+
+`OpCode::is_sim_only` and `Program::parse` carry this today, and
+`only_writing_and_measuring_an_array_is_sim_only` in `lumen-vm` is the test that
+holds it in place.
+
+**What remains is front-end work, not a decision.** `resolve` still refuses `sim`
+blocks and `emit` still refuses accessors — loudly and by name, which is the
+right failure while it lasts: the grammar and the formatter both carry them, so a
+file using one is understood, kept and reformatted correctly, and refused only
+where the code would have to exist.

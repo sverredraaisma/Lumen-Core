@@ -5,7 +5,7 @@
 //! 0    1     magic          0x4C
 //! 1    1     version        major<<4 | minor
 //! 2    1     type
-//! 3    1     flags          bit0 encrypted, bit1 fragment, bit2 last-fragment
+//! 3    1     flags          bit0 encrypted, bit1 fragment, bit2 last, bit3 first
 //! 4    2     mesh_prefix    first 2 bytes of mesh_id
 //! 6    4     sender_prefix  first 4 bytes of sender uuid
 //! 10   4     sequence       per sender, per boot
@@ -80,6 +80,17 @@ impl Flags {
     pub const FRAGMENT: u8 = 1 << 1;
     /// This is the final fragment.
     pub const LAST_FRAGMENT: u8 = 1 << 2;
+    /// This is the first fragment.
+    ///
+    /// Fragments are identified by consecutive `sequence` values and carry no
+    /// index, which is what keeps the four bytes an index would cost off every
+    /// datagram in the system. Marking the *first* one costs a reserved flag bit
+    /// instead of those four bytes, and without it reassembly has a hole: a
+    /// receiver that misses the opening fragment cannot tell it started in the
+    /// middle, so it would assemble a truncated message and deliver it as
+    /// complete. With it, missing the start means the message is never begun and
+    /// is correctly discarded.
+    pub const FIRST_FRAGMENT: u8 = 1 << 3;
 
     pub const fn empty() -> Self {
         Flags(0)
@@ -104,6 +115,10 @@ impl Flags {
 
     pub const fn is_last_fragment(self) -> bool {
         self.contains(Self::LAST_FRAGMENT)
+    }
+
+    pub const fn is_first_fragment(self) -> bool {
+        self.contains(Self::FIRST_FRAGMENT)
     }
 }
 
