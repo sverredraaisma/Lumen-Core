@@ -8,7 +8,7 @@ language = 1
 [[file]]
 path = "capture.lfx"
 group = "Capture"
-sha256 = "61e002c85264e4763ed30899888ebf568f1c0d6967bd8a51232382d5215463b0"
+sha256 = "461a886fd5eda3d91ba9de09a28f61d5fc1f7635d55e5fd97a64061872613402"
 
 [[file]]
 path = "colour.lfx"

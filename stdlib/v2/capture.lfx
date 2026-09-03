@@ -45,73 +45,78 @@ fn bit(v : float, k : float) -> float {
   return floor(fract(v / pow2(k + 1)) * 2)
 }
 
-# Which bit of the frame is being transmitted at time `t`, at `rate` bits per
-# second.
-fn code_index(t : float, rate : float) -> float {
-  return floor(t * rate)
+# How many bits one frame takes: two delimiter symbols, then the index.
+fn code_length(bits : float) -> float {
+  return 2 + bits
 }
 
-# Position within the current bit, 0..1.
+# Which symbol of the frame is on air at time `t`, at `rate` bits per second.
+#
+# Cycles, so the frame repeats for as long as the capture source is active. An
+# LED that transmitted its index once and then went quiet could only be read by a
+# phone that happened to start filming before it began, which is not something a
+# user can be asked to do.
+fn code_index(t : float, rate : float, bits : float) -> float {
+  return floor(fract(t * rate / code_length(bits)) * code_length(bits))
+}
+
+# Position within the current symbol, 0..1.
 fn code_phase(t : float, rate : float) -> float {
   return fract(t * rate)
 }
 
-# How many bits one frame takes: four sync, one start, then the index.
-fn code_length(bits : float) -> float {
-  return 5 + bits
+# The delimiter: one symbol held high, then one held low.
+#
+# Both are **Manchester violations** - a symbol with no transition in its middle,
+# which the encoding cannot otherwise produce. That is what makes the delimiter
+# unambiguous, and it is not a refinement: with an ordinary bit pattern for a
+# preamble, an index that happens to contain that pattern is decodable at two
+# alignments at once. Index 255 sends eight consecutive ones, so a `1 1 1 1 0`
+# preamble appeared inside its own index field and the decoder split its
+# confidence exactly in half between the right answer and a wrong one.
+#
+# A violation costs one symbol of DC balance out of every fourteen. Worth it: the
+# alternative is bit stuffing, which makes the frame length depend on the index
+# and so makes the decoder's job harder rather than easier.
+fn code_is_high_delimiter(k : float) -> float {
+  return 1 - step(1, k)
 }
 
-# One bit of the frame an LED transmits: `1 1 1 1 0`, then the index, least
-# significant bit first.
-#
-# The four ones and a zero are a start delimiter. It is what lets the phone find
-# the beginning of a frame in video it started recording at an arbitrary moment,
-# without knowing the mesh clock — which is the whole point of encoding this way
-# rather than counting from a synchronised instant.
-#
-# **There is no checksum, deliberately.** The obvious parity bit costs more than
-# it is worth here: computing it needs every index bit, each of which inlines its
-# own power-of-two ladder, and the pixel profile has no loop to share them
-# between. It came to several hundred instructions for one bit of protection.
-#
-# The LED transmits continuously and the phone films it for as long as it likes,
-# so the check that costs nothing is **agreement between consecutive frames**.
-# That also catches the errors a parity bit misses — a frame decoded at the wrong
-# alignment usually decodes differently next time — and it is the same quantity
-# the mapper wants anyway, since a per-LED confidence is what tells a user which
-# LEDs are worth re-scanning.
-fn code_bit(index : float, bits : float, k : float) -> float {
-  let in_sync = 1 - step(4, k)
-  let in_index = step(5, k) * (1 - step(5 + bits, k))
-  return in_sync + in_index * bit(index, k - 5)
+# True while the index is being transmitted, least significant bit first.
+fn code_in_index(k : float) -> float {
+  return step(2, k)
 }
 
-# The start bit needs no term: it is the one position that is neither sync nor
-# index, so both terms are zero there and the frame carries its zero for free.
-
-# The brightness an LED shows while transmitting its own index, Manchester
-# encoded.
+# The divisor that extracts the index bit belonging to symbol `k`.
 #
-# Manchester means every bit carries a transition in its middle: a one is high
-# then low, a zero is low then high. Two consequences, both of which the phone
-# depends on. The signal is **self-clocking**, so the decoder recovers the bit
-# rate from the video and never needs the mesh clock — sync then improves
-# accuracy instead of being a hard dependency. And it is **DC balanced**, so
-# every LED is lit exactly half the time regardless of its index, which keeps a
-# camera's auto-exposure from hunting between a dark strip and a bright one.
+# Hoist this. It is the expensive part of a capture pattern and it depends only
+# on `k`, so at effect level it is computed once a frame instead of once per LED.
+fn code_divisor(k : float) -> float {
+  return pow2(k - 1)
+}
+
+# The brightness an LED shows while transmitting its own index.
+#
+# Manchester means every index symbol carries a transition in its middle: a one
+# is high then low, a zero is low then high. Two consequences, both of which the
+# phone depends on. The signal is **self-clocking**, so the decoder recovers
+# phase from the video and never needs the mesh clock - sync then improves
+# accuracy instead of being a hard dependency. And it is **DC balanced** across
+# the index, so every LED is lit close to half the time whatever its index, which
+# keeps a camera's auto-exposure from hunting between a dark strip and a bright
+# one.
 #
 # `bits` is how many index bits to send: 9 covers 512 LEDs, 12 covers 4096. Send
 # no more than needed, because frame time is what a user experiences as how long
 # mapping takes.
 #
 # Pick `rate` against the camera, not against how fast the LED can blink. A
-# decoder needs several samples per half-bit, so at 30 fps a rate above about 6
-# leaves too little to find the mid-bit transition in.
+# decoder needs several samples per half-symbol, so at 30 fps a rate above about
+# 6 leaves too little to find the mid-symbol transition in.
 fn code_level(index : float, bits : float, t : float, rate : float) -> float {
-  let k = code_index(t, rate)
+  let k = code_index(t, rate, bits)
   let phase = code_phase(t, rate)
-  let b = code_bit(index, bits, k)
-  return select(step(0.5, phase), 1 - b, b)
+  let b = floor(fract(index / code_divisor(k)) * 2)
+  let manchester = select(step(0.5, phase), 1 - b, b)
+  return code_is_high_delimiter(k) + code_in_index(k) * manchester
 }
-
-# First half of the bit period carries the bit, second half its complement.
