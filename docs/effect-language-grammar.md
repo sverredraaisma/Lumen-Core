@@ -251,6 +251,48 @@ Warnings, all worth having early ([[Desktop Application#Debugging effects]]):
 - Should `fn` bodies declare their own `channel` requirements, propagating to callers? Convenient, but it makes bandwidth cost non-local. Allow it and surface the propagation in the editor.
 `budget n on <class>` is now settled as an optional declaration — it is what [[Effect Cookbook#This note is generated]] enforces in CI, and it lets a shared effect make a machine-checkable claim about what it costs. Ignored entirely for personal effects.
 
+### What a `sim` block means
+
+The grammar gave the syntax and left the semantics to whoever implemented it.
+Resolving one forced three decisions; each is now checked by the compiler and
+each is worth knowing before writing a simulation.
+
+**The sim's name denotes its elements.** `foreach p in swarm` inside
+`sim swarm(...)` iterates the element array. It is the reading the accessor
+table already implies — `swarm.count` is the element count and
+`swarm.influence(p, r)` sums over them — and a name that meant one thing to a
+loop and another to an accessor would be worse than either.
+
+**`count` is required and must be a whole-number literal.** It sizes an array in
+a profile with no dynamic allocation, and it is what makes a per-pixel
+accumulation over the elements costable before an effect ships. A `count` of
+zero is refused: a simulation with no elements has nothing for an accessor to
+sum over.
+
+**A field exists if the block assigns it anywhere.** The grammar says an
+element's fields are "`p.pos`, `p.vel` and any others the block assigns", so
+assignment is the declaration. They are collected across the whole body before
+any statement is checked, so a field assigned late is readable early — which is
+exactly what a simulation that updates velocity from position and then position
+from velocity needs.
+
+**Open: an element's fields are all `vec3`.** Nothing says what they are typed
+as, and every accessor takes or returns a point or a vector, so that is the
+reading taken. A scalar field is a plausible thing to want and cannot currently
+be written; inferring each field's type from what is assigned to it is the
+obvious answer and needs a second pass that does not exist yet.
+
+**Open: where an accessor's element count comes from when the sim is not local.**
+A `channel x : sim<T>` names a record type and carries no count, so a device
+receiving a simulation it does not itself declare has no compile-time bound for
+the accumulation. Either the channel form grows a count, or accessors are only
+available against a `sim` block the effect declares. Nothing depends on this
+until accessors are lowered.
+
+The body is **checked and not yet lowered**. `emit` refuses it, deliberately at
+emission rather than at resolution, so an author still gets every real complaint
+about what they wrote instead of one blanket refusal that hides them all.
+
 ### Is `fps` advisory or binding
 
 **Settled: advisory.** An effect says what it was designed for; the device runs

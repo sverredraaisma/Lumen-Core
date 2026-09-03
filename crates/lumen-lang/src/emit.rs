@@ -75,6 +75,22 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
         inline_depth: 0,
         failed: false,
     };
+
+    // The body of a `sim` is understood by `resolve` and cannot be lowered yet.
+    // Refused here rather than there, so an author still gets every real
+    // complaint about what they wrote - an unknown name, a missing `count`, a
+    // field assigned outside a `foreach` - instead of one blanket refusal that
+    // hides all of them. What is missing is code generation, and this is where
+    // code generation says so.
+    for sim in &resolved.effect.sims {
+        e.diags.push(Diagnostic::error(
+            sim.span,
+            "`sim` blocks are not implemented yet",
+            "the block is checked but cannot be compiled; remove it, or render the effect without it for now",
+        ));
+        e.failed = true;
+    }
+
     e.run();
     if e.failed || e.diags.has_errors() {
         return None;

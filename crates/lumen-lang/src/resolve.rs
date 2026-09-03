@@ -422,6 +422,10 @@ pub enum SymbolKind {
     Palette,
     Curve,
     Fn,
+    /// A `sim` block, which names its own element array.
+    Sim,
+    /// The binding a `foreach` introduces for one element.
+    SimElement,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -509,6 +513,7 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
         read: alloc::collections::BTreeSet::new(),
         used: alloc::collections::BTreeSet::new(),
         fns: effect.fns.clone(),
+        sim_fields: alloc::collections::BTreeSet::new(),
     };
 
     for (index, p) in palettes.iter().enumerate() {
@@ -816,11 +821,7 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
         let (_, _) = r.check(&st.init);
     }
     for s in &effect.sims {
-        r.diags.push(Diagnostic::error(
-            s.span,
-            "`sim` blocks are not implemented yet",
-            "remove the sim, or render the effect without it for now",
-        ));
+        resolve_sim(&mut r, s);
     }
 
     // `fps` is advisory, so almost any value is somebody's legitimate
@@ -911,6 +912,12 @@ struct Resolver<'d> {
     used: alloc::collections::BTreeSet<String>,
     /// The effect's functions, for arity checking at the call site.
     fns: Vec<FnDecl>,
+    /// Element fields of the `sim` currently being checked.
+    ///
+    /// Empty outside one. Held on the resolver rather than threaded through
+    /// `check` because an element field can appear anywhere an expression can,
+    /// and every other arm would have to carry a parameter it never reads.
+    sim_fields: alloc::collections::BTreeSet<String>,
 }
 
 impl Resolver<'_> {
@@ -973,6 +980,29 @@ impl Resolver<'_> {
             }
             ExprKind::Field { base, field } => {
                 let (ty, rate) = self.check(base);
+                // An element's fields are whatever the block assigns. Which
+                // ones those are is known before any statement is checked, so a
+                // field assigned late in the body is still readable early -
+                // what a simulation updating velocity from position and then
+                // position from velocity needs.
+                if ty == Type::Element {
+                    if !self.sim_fields.contains(field) {
+                        let known: alloc::vec::Vec<&str> =
+                            self.sim_fields.iter().map(|f| f.as_str()).collect();
+                        self.diags.push(Diagnostic::error(
+                            e.span,
+                            alloc::format!("no element field `{field}` is assigned in this sim"),
+                            if known.is_empty() {
+                                alloc::string::String::from(
+                                    "a field exists once the block assigns it, as in `p.vel = ...`",
+                                )
+                            } else {
+                                alloc::format!("this sim assigns {}", known.join(", "))
+                            },
+                        ));
+                    }
+                    return (Type::Vec3, Rate::Frame);
+                }
                 // `<sim>.count` is the declared element count, which is a
                 // compile-time constant and the only field a simulation has.
                 if ty == Type::Sim {
@@ -1264,6 +1294,218 @@ fn calls_itself(f: &FnDecl, all: &[FnDecl]) -> Option<String> {
         }
     }
     reaches(&f.name, &f.body, all, &mut seen)
+}
+
+/// The argument every sim must carry.
+const COUNT: &str = "count";
+
+/// Check one `sim` block: its arguments, then its body.
+///
+/// The block is checked and not emitted. What an author writes is therefore
+/// understood and reported against precisely, and what is missing is code
+/// generation rather than comprehension - which is the right way round for a
+/// construct the formatter already round-trips.
+fn resolve_sim(r: &mut Resolver<'_>, sim: &Sim) {
+    let count = sim_count(r, sim);
+
+    // The element fields, which are whatever the block assigns anywhere in its
+    // body. Collected before anything is checked so a field assigned late is
+    // readable early - which is exactly what a simulation updating velocity
+    // from position and then position from velocity does.
+    r.sim_fields.clear();
+    for stmt in &sim.body {
+        collect_fields(stmt, &mut r.sim_fields);
+    }
+
+    // The sim's own name denotes its elements, so `foreach p in swarm` inside
+    // `sim swarm` iterates them. That is what the accessor table already
+    // implies - `swarm.count` is the element count - and a name meaning one
+    // thing to a loop and another to an accessor would be worse than either.
+    r.declare(
+        &sim.name,
+        Symbol {
+            kind: SymbolKind::Sim,
+            ty: Type::Sim,
+            rate: Rate::Frame,
+            span: sim.span,
+            index: count.unwrap_or(0) as usize,
+        },
+    );
+
+    let mut local = Vec::new();
+    resolve_sim_body(r, sim, &sim.body, &mut local);
+    for name in local {
+        r.symbols.remove(&name);
+    }
+    r.sim_fields.clear();
+}
+
+/// The declared element count, or `None` if it was missing or unusable.
+fn sim_count(r: &mut Resolver<'_>, sim: &Sim) -> Option<u32> {
+    let mut count = None;
+    for (name, value) in &sim.args {
+        // A sim argument sizes an array in a profile with no dynamic
+        // allocation, so it cannot be a `param` or anything else decided at run
+        // time.
+        let Some(k) = const_number(value) else {
+            r.diags.push(Diagnostic::error(
+                value.span,
+                alloc::format!("`{name}` must be a constant"),
+                "a sim argument sizes an array before the program runs, so it cannot depend on a param or a channel",
+            ));
+            continue;
+        };
+        if name == COUNT {
+            if k < 1.0 {
+                r.diags.push(Diagnostic::error(
+                    value.span,
+                    "`count` must be at least 1",
+                    "a simulation with no elements has nothing for an accessor to sum over",
+                ));
+            } else {
+                count = Some(k as u32);
+            }
+        }
+    }
+    if count.is_none() && !sim.args.iter().any(|(n, _)| n == COUNT) {
+        r.diags.push(Diagnostic::error(
+            sim.span,
+            "a sim needs a `count`",
+            "write `sim name(count = 64)`; it sizes the element array and is what makes a per-pixel accessor costable before the effect ships",
+        ));
+    }
+    count
+}
+
+/// A literal number, or `None` for anything the compiler cannot evaluate now.
+fn const_number(e: &Expr) -> Option<f64> {
+    match &e.kind {
+        ExprKind::Number { value, .. } => Some(*value),
+        _ => None,
+    }
+}
+
+/// Every `p.field` an assignment targets, anywhere in the body.
+fn collect_fields(stmt: &SimStmt, out: &mut alloc::collections::BTreeSet<String>) {
+    match stmt {
+        SimStmt::Assign(a) => {
+            if let Some((_, field)) = assigned_field(a) {
+                out.insert(field.to_string());
+            }
+        }
+        SimStmt::If {
+            then, otherwise, ..
+        } => {
+            for s in then.iter().chain(otherwise) {
+                collect_fields(s, out);
+            }
+        }
+        SimStmt::ForEach { body, .. } => {
+            for s in body {
+                collect_fields(s, out);
+            }
+        }
+        SimStmt::Let(_) => {}
+    }
+}
+
+/// `(base, field)` when an assignment targets `base.field`.
+fn assigned_field(a: &Assign) -> Option<(&str, &str)> {
+    a.field.as_deref().map(|f| (a.target.as_str(), f))
+}
+
+/// Check a run of sim statements, declaring anything they bind.
+///
+/// `local` collects the names to remove afterwards. The resolver has one flat
+/// symbol table rather than a scope stack, so a block's bindings are declared
+/// and then withdrawn, exactly as a layer's are.
+fn resolve_sim_body(r: &mut Resolver<'_>, sim: &Sim, body: &[SimStmt], local: &mut Vec<String>) {
+    for stmt in body {
+        match stmt {
+            SimStmt::Let(b) => {
+                let (ty, _) = r.check(&b.value);
+                r.declare(
+                    &b.name,
+                    Symbol {
+                        kind: SymbolKind::Let,
+                        ty,
+                        rate: Rate::Frame,
+                        span: b.span,
+                        index: usize::MAX,
+                    },
+                );
+                local.push(b.name.clone());
+            }
+            SimStmt::Assign(a) => {
+                r.check(&a.value);
+                match assigned_field(a) {
+                    Some((base, _field)) => {
+                        // Assigning through the element binding is how a field
+                        // comes to exist, so an unknown *base* is the error
+                        // rather than an unknown field.
+                        let is_element = r.symbols.get(base).map(|s| s.kind.clone())
+                            == Some(SymbolKind::SimElement);
+                        if !is_element {
+                            r.diags.push(Diagnostic::error(
+                                a.span,
+                                alloc::format!("`{base}` is not an element of a sim"),
+                                "assign a field through the binding a `foreach` introduces, as in `foreach p in name { p.vel = ... }`",
+                            ));
+                        }
+                    }
+                    None => {
+                        // A bare `name = ...` targets a sim-local binding.
+                        if !r.symbols.contains_key(&a.target) {
+                            r.diags.push(Diagnostic::error(
+                                a.span,
+                                alloc::format!("unknown name `{}`", a.target),
+                                "declare it with `let` inside the sim, or assign a field of an element as in `p.vel = ...`",
+                            ));
+                        }
+                    }
+                }
+            }
+            SimStmt::If {
+                cond,
+                then,
+                otherwise,
+                ..
+            } => {
+                r.check(cond);
+                // `if` exists only inside `sim` precisely because the pixel
+                // profile has no data-dependent control flow, so nothing here
+                // constrains what the branches may do.
+                resolve_sim_body(r, sim, then, local);
+                resolve_sim_body(r, sim, otherwise, local);
+            }
+            SimStmt::ForEach {
+                binding,
+                over,
+                body,
+                span,
+            } => {
+                if over != &sim.name {
+                    r.diags.push(Diagnostic::error(
+                        *span,
+                        alloc::format!("`{over}` is not something this sim can iterate"),
+                        "a sim iterates its own elements; write `foreach p in <the sim's name>`",
+                    ));
+                }
+                r.declare(
+                    binding,
+                    Symbol {
+                        kind: SymbolKind::SimElement,
+                        ty: Type::Element,
+                        rate: Rate::Frame,
+                        span: *span,
+                        index: usize::MAX,
+                    },
+                );
+                local.push(binding.clone());
+                resolve_sim_body(r, sim, body, local);
+            }
+        }
+    }
 }
 
 impl Resolver<'_> {

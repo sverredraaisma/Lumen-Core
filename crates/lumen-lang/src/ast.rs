@@ -140,6 +140,14 @@ pub enum Type {
     Color,
     Palette,
     Curve,
+    /// One element of a simulation, as bound by a `foreach`.
+    ///
+    /// Its fields are whatever the block assigns, and each is a [`Type::Vec3`].
+    /// The grammar does not say what an element's fields are typed as; every
+    /// accessor takes or returns a point or a vector, so that is the reading it
+    /// implies. Recorded as an open question rather than settled - a scalar
+    /// field is a plausible thing to want and cannot currently be written.
+    Element,
     /// A simulation's broadcast state, reached through a `sim<..>` channel.
     ///
     /// A handle like [`Type::Palette`] and [`Type::Curve`]: it names something
@@ -168,6 +176,7 @@ impl Type {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Type::Element => "element",
             Type::Sim => "sim",
             Type::Float => "float",
             Type::Int => "int",

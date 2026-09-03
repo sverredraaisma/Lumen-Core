@@ -1253,3 +1253,147 @@ fn methods_belong_to_sims_and_nothing_else() {
         "{es:?}"
     );
 }
+
+// ---- Sim blocks ------------------------------------------------------------
+//
+// The body is checked and still not lowered. Splitting it that way is worth
+// having on its own: what an author writes is understood and reported against
+// precisely, and what is missing is code generation rather than comprehension.
+
+fn sim_block_errors(header: &str, body: &str) -> Vec<String> {
+    errors(&wrap(&format!(
+        "  sim {header} {{\n{body}\n  }}\n  layer l {{ color = rgb(0, 0, 0) }}"
+    )))
+}
+
+/// Errors other than the standing "not implemented", which every sim gets.
+fn sim_complaints(header: &str, body: &str) -> Vec<String> {
+    sim_block_errors(header, body)
+        .into_iter()
+        .filter(|e| !e.contains("not implemented"))
+        .collect()
+}
+
+#[test]
+fn a_well_formed_sim_is_refused_only_for_not_being_implemented() {
+    let es = sim_complaints(
+        "swarm(count = 64)",
+        "    let drag = 0.99\n    foreach p in swarm {\n      p.vel = p.vel * drag\n      p.pos = p.pos + p.vel\n    }",
+    );
+    assert!(es.is_empty(), "{es:?}");
+}
+
+#[test]
+fn a_sim_needs_a_count() {
+    // It sizes an array in a profile with no dynamic allocation, and it is what
+    // makes a per-pixel accessor costable before the effect ships.
+    let es = sim_complaints("swarm()", "    let a = 1");
+    assert!(es.iter().any(|e| e == "a sim needs a `count`"), "{es:?}");
+}
+
+#[test]
+fn a_count_must_be_a_constant() {
+    let es = sim_complaints("swarm(count = u)", "    let a = 1");
+    assert!(
+        es.iter().any(|e| e == "`count` must be a constant"),
+        "{es:?}"
+    );
+}
+
+#[test]
+fn a_sim_with_no_elements_is_refused() {
+    let es = sim_complaints("swarm(count = 0)", "    let a = 1");
+    assert!(
+        es.iter().any(|e| e == "`count` must be at least 1"),
+        "{es:?}"
+    );
+}
+
+#[test]
+fn a_sim_iterates_its_own_elements() {
+    // The sim's name denotes its elements, which is what the accessor table
+    // already implies - `swarm.count` is the element count. A name meaning one
+    // thing to a loop and another to an accessor would be worse than either.
+    let es = sim_complaints(
+        "swarm(count = 8)",
+        "    foreach p in flock {\n      p.vel = 1\n    }",
+    );
+    assert!(
+        es.iter()
+            .any(|e| e == "`flock` is not something this sim can iterate"),
+        "{es:?}"
+    );
+}
+
+#[test]
+fn an_element_field_must_be_assigned_somewhere_to_be_read() {
+    // Assignment is the declaration: the grammar says fields are "`p.pos`,
+    // `p.vel` and any others the block assigns".
+    let es = sim_complaints(
+        "swarm(count = 8)",
+        "    foreach p in swarm {\n      p.vel = p.heading\n    }",
+    );
+    assert!(
+        es.iter()
+            .any(|e| e == "no element field `heading` is assigned in this sim"),
+        "{es:?}"
+    );
+}
+
+#[test]
+fn a_field_assigned_later_is_readable_earlier() {
+    // Which is what a simulation updating velocity from position and then
+    // position from velocity does, so the fields are collected before anything
+    // is checked rather than as each statement is reached.
+    let es = sim_complaints(
+        "swarm(count = 8)",
+        "    foreach p in swarm {\n      p.vel = p.pos\n      p.pos = p.vel\n    }",
+    );
+    assert!(es.is_empty(), "{es:?}");
+}
+
+#[test]
+fn a_field_can_only_be_assigned_through_an_element() {
+    let es = sim_complaints("swarm(count = 8)", "    q.vel = 1");
+    assert!(
+        es.iter().any(|e| e == "`q` is not an element of a sim"),
+        "{es:?}"
+    );
+}
+
+#[test]
+fn a_bare_assignment_needs_a_binding_to_target() {
+    let es = sim_complaints("swarm(count = 8)", "    a = 1");
+    assert!(es.iter().any(|e| e == "unknown name `a`"), "{es:?}");
+}
+
+#[test]
+fn a_sim_local_binding_is_assignable_and_goes_out_of_scope() {
+    let es = sim_complaints("swarm(count = 8)", "    let a = 1\n    a = 2");
+    assert!(es.is_empty(), "{es:?}");
+
+    // And is not visible to the layers, which run on every device rather than
+    // only on the sim master.
+    let leaked = errors(&wrap(
+        "  sim swarm(count = 8) {\n    let a = 1\n  }\n  layer l { color = rgb(a, 0, 0) }",
+    ));
+    assert!(
+        leaked.iter().any(|e| e.contains("unknown name `a`")),
+        "a sim-local binding escaped into a layer: {leaked:?}"
+    );
+}
+
+#[test]
+fn branches_inside_a_sim_are_checked() {
+    // `if` exists only inside `sim`, because the pixel profile has no
+    // data-dependent control flow - so this is the only place it can be wrong.
+    let es = sim_complaints(
+        "swarm(count = 8)",
+        "    foreach p in swarm {\n      if p.vel > 1 {\n        p.vel = p.nope\n      } else {\n        p.vel = 0\n      }\n    }",
+    );
+    assert!(
+        es.iter()
+            .any(|e| e == "no element field `nope` is assigned in this sim"),
+        "{es:?}"
+    );
+}

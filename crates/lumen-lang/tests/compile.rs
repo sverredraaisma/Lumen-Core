@@ -558,18 +558,29 @@ fn an_unread_channel_is_a_warning() {
 fn unimplemented_constructs_are_refused_loudly_rather_than_ignored() {
     // Compiling something that silently does less than the author wrote is the
     // one outcome worse than refusing.
+    //
+    // A *well formed* sim, so what is being tested is the refusal and not some
+    // earlier complaint about the body. `resolve` checks the body now; only
+    // lowering is missing, and this is the message that says so.
     let es = errors(
         r#"
 lumen 1
 effect "x" {
   sim particles(count = 8) {
-    a = 1
+    let drag = 0.99
+    foreach p in particles {
+      p.vel = p.vel * drag
+    }
   }
   layer b { color = rgb(0,0,0) }
 }
 "#,
     );
     assert!(es.iter().any(|e| e.contains("not implemented")), "{es:?}");
+    assert!(
+        es.iter().all(|e| !e.contains("unknown name")),
+        "a well-formed sim body was complained about: {es:?}"
+    );
 }
 
 #[test]
