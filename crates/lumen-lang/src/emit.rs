@@ -56,6 +56,14 @@ impl Val {
 pub struct Compiled {
     pub bytecode: Vec<u8>,
     pub report: BudgetReport,
+    /// The simulation's own program, when the effect declares one with a body.
+    ///
+    /// A second artefact rather than a section of the first, because only the
+    /// **sim master** ever runs it while every device runs the pixel program.
+    /// Shipping one program would mean every device carrying code it must never
+    /// execute, and the profile check that keeps `ASTORE` out of a pixel kernel
+    /// is a property of a whole program rather than of a section.
+    pub sim: Option<Vec<u8>>,
 }
 
 /// Compile a resolved effect.
@@ -81,6 +89,9 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
         high_water: R_SCRATCH,
         inline_depth: 0,
         failed: false,
+        sim_body: Vec::new(),
+        in_sim: false,
+        sim_builder: ProgramBuilder::new(),
     };
 
     // The body of a `sim` is understood by `resolve` and cannot be lowered yet.
@@ -91,29 +102,33 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
     // code generation says so.
     for sim in &resolved.effect.sims {
         // An **empty** body is a declaration of shape rather than a simulation:
-        // "a simulation of this many elements arrives here". It compiles,
-        // because there is nothing to lower and the accessors only need the
-        // count. That is how a device that *receives* a simulation it does not
-        // run declares what it is receiving - the case a `sim<..>` channel
-        // cannot serve, since it names a record type and carries no count.
+        // "a simulation of this many elements arrives here". Nothing to lower,
+        // and the accessors only need the count. That is how a device that
+        // *receives* a simulation it does not run declares what it is
+        // receiving - the case a `sim<..>` channel cannot serve, since it names
+        // a record type and carries no count.
         if sim.body.is_empty() {
             continue;
         }
-        // A body needs somewhere to be lowered *to*, and there is nowhere: the
-        // program format has `once`, `frame` and `pixel` sections and a sim runs
-        // in a profile of its own, so compiling one means emitting a second
-        // program that `Compiled` has no room for. That is the structural piece
-        // still missing, and it is why this refusal is about the block rather
-        // than about the accessors, which do lower.
-        e.diags.push(Diagnostic::error(
-            sim.span,
-            "a `sim` body cannot be compiled yet",
-            "the block is checked, and its accessors work; leave the body empty to declare a simulation this device only reads",
-        ));
-        e.failed = true;
+        if resolved.effect.sims.len() > 1 {
+            e.diags.push(Diagnostic::error(
+                sim.span,
+                "an effect may run only one `sim`",
+                "the device runs one simulation program; combine them, or leave all but one body empty to declare simulations this device only reads",
+            ));
+            e.failed = true;
+            break;
+        }
     }
 
     e.run();
+    if e.failed || e.diags.has_errors() {
+        return None;
+    }
+
+    // After the pixel program, so a failure in the sim body does not lose the
+    // diagnostics the layers produced.
+    let sim = emit_sim_program(&mut e, resolved);
     if e.failed || e.diags.has_errors() {
         return None;
     }
@@ -142,7 +157,34 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
     Some(Compiled {
         bytecode: builder.build(),
         report,
+        sim,
     })
+}
+
+/// Build the simulation's own program, if the effect declares one with a body.
+///
+/// A separate artefact because only the sim master runs it. Its instructions go
+/// in the `frame` section: a sim body runs once per frame on one device, which
+/// is what that section is.
+fn emit_sim_program(e: &mut Emitter<'_, '_>, resolved: &Resolved<'_>) -> Option<Vec<u8>> {
+    let sim = resolved.effect.sims.iter().find(|s| !s.body.is_empty())?;
+    let declared = resolved.sims.iter().find(|s| s.name == sim.name)?;
+
+    // The field list comes from `resolve`, which is the only place it is
+    // worked out. Recomputing it here is how the two came to disagree: the
+    // emitter counted only assigned fields, so a body reading `p.vel` without
+    // writing it resolved and then silently failed to emit.
+    if !e.emit_sim(sim, declared.count, &declared.fields) {
+        return None;
+    }
+
+    let mut builder = core::mem::replace(&mut e.sim_builder, ProgramBuilder::new());
+    builder.profile_sim = true;
+    for ins in &e.sim_body {
+        builder.push(Section::Frame, *ins);
+    }
+    builder.budget = e.sim_body.iter().map(|i| i.op.cost()).sum();
+    Some(builder.build())
 }
 
 /// A stable hash of the resolved effect, so an editor can recognise a program
@@ -191,6 +233,21 @@ struct Emitter<'a, 'd> {
     high_water: u8,
     inline_depth: u8,
     failed: bool,
+    /// Instructions for the simulation's own program, while one is being built.
+    ///
+    /// A third target for [`Emitter::push`], selected by `in_sim` rather than by
+    /// rate: everything in a sim body runs at the same time, once per frame on
+    /// one device, so rate says nothing useful about where it goes.
+    sim_body: Vec<Instruction>,
+    in_sim: bool,
+    /// The simulation program's own constant pool.
+    ///
+    /// Separate because the two are separate programs: a `LOAD_K` immediate is
+    /// an index into *its own* program's pool, so routing sim constants into
+    /// the pixel program's builder produced a sim program whose immediates
+    /// pointed into a pool it did not have — which the VM rejected, correctly,
+    /// as a bad program.
+    sim_builder: ProgramBuilder,
 }
 
 /// How deep function inlining may nest.
@@ -280,6 +337,224 @@ impl Emitter<'_, '_> {
             self.move_into(Rate::Pixel, dst, v);
             self.bound.push((l.name.clone(), dst));
         }
+    }
+
+    // ---- the simulation's own program -------------------------------------
+
+    /// Lower a `sim` body into the instructions of its own program.
+    ///
+    /// Returns `false` if anything in the body has no lowering, having already
+    /// said which.
+    fn emit_sim(&mut self, sim: &crate::ast::Sim, count: u32, fields: &[String]) -> bool {
+        // A fresh register file: the sim program is a separate artefact and
+        // shares nothing with the pixel program's allocation.
+        let saved = (self.next_permanent, self.temp_floor, self.next_temp);
+        self.next_permanent = R_SCRATCH;
+        self.temp_floor = R_SCRATCH;
+        self.next_temp = R_SCRATCH;
+        self.in_sim = true;
+
+        let ok = self.sim_stmts(&sim.body, sim, count, fields);
+
+        self.in_sim = false;
+        let (p, f, t) = saved;
+        self.next_permanent = p;
+        self.temp_floor = f;
+        self.next_temp = t;
+        ok
+    }
+
+    fn sim_stmts(
+        &mut self,
+        body: &[SimStmt],
+        sim: &crate::ast::Sim,
+        count: u32,
+        fields: &[String],
+    ) -> bool {
+        for stmt in body {
+            match stmt {
+                SimStmt::Let(b) => {
+                    let Some(v) = self.expr(Rate::Frame, &b.value) else {
+                        return false;
+                    };
+                    let Some(dst) = self.permanent(v.width) else {
+                        return false;
+                    };
+                    for k in 0..v.width {
+                        self.push(
+                            Rate::Frame,
+                            Instruction::new(OpCode::Mov, dst.base + k, v.base + k, 0),
+                        );
+                    }
+                    self.bound.push((b.name.clone(), dst));
+                }
+                SimStmt::Assign(a) if a.field.is_none() => {
+                    let Some(v) = self.expr(Rate::Frame, &a.value) else {
+                        return false;
+                    };
+                    let Some(dst) = self
+                        .bound
+                        .iter()
+                        .find(|(n, _)| n == &a.target)
+                        .map(|(_, v)| *v)
+                    else {
+                        return false;
+                    };
+                    for k in 0..dst.width.min(v.width) {
+                        self.push(
+                            Rate::Frame,
+                            Instruction::new(OpCode::Mov, dst.base + k, v.base + k, 0),
+                        );
+                    }
+                }
+                // A field assignment outside a `foreach` has no element to write
+                // to; `resolve` has already said so.
+                SimStmt::Assign(_) => return false,
+                SimStmt::If { span, .. } => {
+                    // `MASK_TEST` can express this - it skips forward when a
+                    // register is zero - but a forward skip needs its distance
+                    // patched once the branch is emitted, and doing that
+                    // carelessly is how a compiler starts producing plausible
+                    // wrong code. A separate change, with its own tests.
+                    self.diags.push(Diagnostic::error(
+                        *span,
+                        "`if` inside a `sim` cannot be compiled yet",
+                        "write the branch arithmetically with `select` or `step`, which is what the pixel profile does",
+                    ));
+                    return false;
+                }
+                SimStmt::ForEach { binding, body, .. } => {
+                    // Unrolled over the count, for the same reason the accessors
+                    // are: the trip count is a compile-time constant, so the
+                    // program stays costable and needs no loop machinery.
+                    for k in 0..count {
+                        if !self.sim_element(binding, body, k, sim, count, fields) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// One unrolled iteration: bind the element's fields, run the body, write
+    /// back whatever it assigned.
+    fn sim_element(
+        &mut self,
+        binding: &str,
+        body: &[SimStmt],
+        k: u32,
+        sim: &crate::ast::Sim,
+        count: u32,
+        fields: &[String],
+    ) -> bool {
+        let mark = self.next_temp;
+        let bound_before = self.bound.len();
+
+        // Load every field of this element into registers. Loading all of them
+        // rather than only those read is what keeps the write-back below
+        // simple, and a field nobody touches costs three loads once per element
+        // rather than anything per pixel.
+        let mut slots = Vec::new();
+        for (array, field) in fields.iter().enumerate() {
+            let Some(v) = self.temp(3) else {
+                return false;
+            };
+            let idx = match self.temp(1) {
+                Some(i) => i,
+                None => return false,
+            };
+            for lane in 0..3u8 {
+                let c = self.constant((k * 3 + lane as u32) as f64);
+                self.push(
+                    Rate::Frame,
+                    Instruction::with_imm(OpCode::LoadK, idx.base, c),
+                );
+                self.push(
+                    Rate::Frame,
+                    Instruction::new(OpCode::ALoad, v.base + lane, array as u8, idx.base),
+                );
+            }
+            self.bound.push((alloc::format!("{binding}.{field}"), v));
+            slots.push((array as u8, v));
+        }
+
+        let ok = self.sim_stmts_in_element(body, sim, count, fields, binding);
+
+        if ok {
+            // Write back, in the same order, so a field read by a later element
+            // sees this one's update - which is what makes the unrolled loop
+            // mean the same thing as a real one.
+            for (array, v) in &slots {
+                let idx = match self.temp(1) {
+                    Some(i) => i,
+                    None => return false,
+                };
+                for lane in 0..3u8 {
+                    let c = self.constant((k * 3 + lane as u32) as f64);
+                    self.push(
+                        Rate::Frame,
+                        Instruction::with_imm(OpCode::LoadK, idx.base, c),
+                    );
+                    // `ASTORE` is not `ALOAD` with the operands in the same
+                    // places: it takes the array in `a`, the index register in
+                    // `b` and the value in `c`, where `ALOAD` puts the
+                    // destination in `a`. Getting it the other way round stored
+                    // into "array 15" - the value register, read as an array id.
+                    self.push(
+                        Rate::Frame,
+                        Instruction::new(OpCode::AStore, *array, idx.base, v.base + lane),
+                    );
+                }
+            }
+        }
+
+        self.bound.truncate(bound_before);
+        self.release_to(mark);
+        ok
+    }
+
+    /// The body of a `foreach`, where `p.field` names a bound register.
+    fn sim_stmts_in_element(
+        &mut self,
+        body: &[SimStmt],
+        sim: &crate::ast::Sim,
+        count: u32,
+        fields: &[String],
+        binding: &str,
+    ) -> bool {
+        for stmt in body {
+            if let SimStmt::Assign(a) = stmt {
+                if let Some(field) = &a.field {
+                    if a.target != binding {
+                        return false;
+                    }
+                    let Some(v) = self.expr(Rate::Frame, &a.value) else {
+                        return false;
+                    };
+                    let name = alloc::format!("{binding}.{field}");
+                    let Some(dst) = self.bound.iter().find(|(n, _)| n == &name).map(|(_, v)| *v)
+                    else {
+                        return false;
+                    };
+                    // A scalar assigned to a three-lane field fills all three,
+                    // which is what `p.vel = 0` has to mean.
+                    for lane in 0..3u8 {
+                        let src = if v.width == 1 { v.base } else { v.base + lane };
+                        self.push(
+                            Rate::Frame,
+                            Instruction::new(OpCode::Mov, dst.base + lane, src, 0),
+                        );
+                    }
+                    continue;
+                }
+            }
+            if !self.sim_stmts(core::slice::from_ref(stmt), sim, count, fields) {
+                return false;
+            }
+        }
+        true
     }
 
     // ---- sim accessors ----------------------------------------------------
@@ -521,6 +796,12 @@ impl Emitter<'_, '_> {
     }
 
     fn push(&mut self, rate: Rate, ins: Instruction) {
+        // A sim body runs once per frame on one device, so rate says nothing
+        // useful about where its instructions go.
+        if self.in_sim {
+            self.sim_body.push(ins);
+            return;
+        }
         if rate == Rate::Pixel {
             self.pixel.push(ins);
         } else {
@@ -529,6 +810,11 @@ impl Emitter<'_, '_> {
     }
 
     fn constant(&mut self, v: f64) -> u16 {
+        // Into whichever program is being built. The two have separate pools,
+        // and an immediate is an index into its own.
+        if self.in_sim {
+            return self.sim_builder.constant(to_q16(v));
+        }
         self.builder.constant(to_q16(v))
     }
 
@@ -832,6 +1118,21 @@ impl Emitter<'_, '_> {
             }
             ExprKind::Ident(name) => self.ident(rate, name, e),
             ExprKind::Field { base, field } => {
+                // Inside a sim body, `p.pos` names one of the element's fields,
+                // which is held whole in three registers rather than being a
+                // lane of some larger value. Checked before the base is
+                // evaluated, because evaluating it would look up `p` - which is
+                // not a value and has no register of its own.
+                if self.in_sim {
+                    if let ExprKind::Ident(binding) = &base.kind {
+                        let name = alloc::format!("{binding}.{field}");
+                        if let Some(v) =
+                            self.bound.iter().find(|(n, _)| n == &name).map(|(_, v)| *v)
+                        {
+                            return Some(v);
+                        }
+                    }
+                }
                 let v = self.expr(rate, base)?;
                 let k = match field.as_str() {
                     "x" | "u" | "r" => 0,

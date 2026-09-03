@@ -559,17 +559,19 @@ fn unimplemented_constructs_are_refused_loudly_rather_than_ignored() {
     // Compiling something that silently does less than the author wrote is the
     // one outcome worse than refusing.
     //
-    // A *well formed* sim, so what is being tested is the refusal and not some
-    // earlier complaint about the body. `resolve` checks the body now; only
-    // lowering is missing, and this is the message that says so.
+    // `if` inside a `sim` is what is still missing. `MASK_TEST` can express it,
+    // but a forward skip needs its distance patched once the branch is emitted,
+    // and doing that carelessly is how a compiler starts producing plausible
+    // wrong code.
     let es = errors(
         r#"
 lumen 1
 effect "x" {
   sim particles(count = 8) {
-    let drag = 0.99
     foreach p in particles {
-      p.vel = p.vel * drag
+      if p.pos > 1 {
+        p.pos = 0
+      }
     }
   }
   layer b { color = rgb(0,0,0) }
@@ -579,10 +581,6 @@ effect "x" {
     assert!(
         es.iter().any(|e| e.contains("cannot be compiled yet")),
         "{es:?}"
-    );
-    assert!(
-        es.iter().all(|e| !e.contains("unknown name")),
-        "a well-formed sim body was complained about: {es:?}"
     );
 }
 
@@ -1963,4 +1961,132 @@ effect "i" {
     let out = run_accessor(src, &[[0.0, 0.0, 0.0]], 0.9);
     assert!(out[0] >= 0.0, "influence went negative: {}", out[0]);
     assert!(out[0] < 0.01, "far outside the radius, got {}", out[0]);
+}
+
+#[test]
+fn a_sim_with_a_body_produces_its_own_program() {
+    // The structural piece: a sim runs in a profile of its own, so it is a
+    // second artefact rather than a section of the pixel program. Only the sim
+    // master ever loads it, and shipping one program would mean every device
+    // carrying code it must never execute.
+    let src = r#"
+lumen 1
+effect "particles" {
+  sim swarm(count = 4) {
+    foreach p in swarm {
+      p.pos = p.pos + p.vel
+      p.vel = p.vel * 0.99
+    }
+  }
+  layer base { color = rgb(1, 0, 0) }
+}
+"#;
+    let (compiled, diags) = compile(src);
+    assert!(!diags.has_errors(), "{}", diags.render(src));
+    let compiled = compiled.expect("compiles");
+
+    let sim = compiled.sim.expect("a sim body produces a program");
+    let program = lumen_vm::program::Program::parse(&sim).expect("the sim program parses");
+    assert_eq!(program.profile, lumen_vm::Profile::Sim);
+    assert!(
+        program.section_len(lumen_vm::program::Section::Frame) > 0,
+        "the sim program is empty"
+    );
+
+    // And the pixel program is a different one, which the device that is not
+    // the sim master runs on its own.
+    let pixel = lumen_vm::program::Program::parse(&compiled.bytecode).expect("parses");
+    assert_eq!(pixel.profile, lumen_vm::Profile::Pixel);
+}
+
+#[test]
+fn a_sim_that_only_declares_its_shape_produces_no_program() {
+    // An empty body says "a simulation of this many elements arrives here".
+    // There is nothing to run, and emitting an empty program would have every
+    // device asking to be the sim master for a simulation nobody simulates.
+    let src = r#"
+lumen 1
+effect "received" {
+  sim swarm(count = 4) {}
+  layer base { let d = swarm.nearest(vec3(u, 0, 0))
+    color = rgb(d, 0, 0) }
+}
+"#;
+    let (compiled, diags) = compile(src);
+    assert!(!diags.has_errors(), "{}", diags.render(src));
+    assert!(compiled.expect("compiles").sim.is_none());
+}
+
+#[test]
+fn a_sim_body_moves_the_elements_it_is_given() {
+    // End to end through the real VM: the sim program is loaded with a starting
+    // state, run once, and the array is checked for what one step of the
+    // integration should have produced.
+    use lumen_vm::q16::Q16;
+    use lumen_vm::vm::{Machine, NoUniforms};
+
+    let src = r#"
+lumen 1
+effect "particles" {
+  sim swarm(count = 2) {
+    foreach p in swarm {
+      p.pos = p.pos + p.vel
+    }
+  }
+  layer base { color = rgb(1, 0, 0) }
+}
+"#;
+    let (compiled, diags) = compile(src);
+    assert!(!diags.has_errors(), "{}", diags.render(src));
+    let sim = compiled.expect("compiles").sim.expect("a sim program");
+    let program = lumen_vm::program::Program::parse(&sim).expect("parses");
+
+    // Array 0 is `pos`, array 1 is `vel`: `pos` is first because the accessors
+    // measure against array 0, and the rest follow in sorted order.
+    struct State {
+        pos: Vec<Q16>,
+        vel: Vec<Q16>,
+    }
+    impl lumen_vm::vm::Arrays for State {
+        fn len(&self, array: u8) -> Option<usize> {
+            match array {
+                0 => Some(self.pos.len()),
+                1 => Some(self.vel.len()),
+                _ => None,
+            }
+        }
+        fn load(&self, array: u8, index: usize) -> Result<Q16, lumen_vm::Fault> {
+            let a = match array {
+                0 => &self.pos,
+                1 => &self.vel,
+                _ => return Err(lumen_vm::Fault::OutOfBounds),
+            };
+            a.get(index).copied().ok_or(lumen_vm::Fault::OutOfBounds)
+        }
+        fn store(&mut self, array: u8, index: usize, v: Q16) -> Result<(), lumen_vm::Fault> {
+            let a = match array {
+                0 => &mut self.pos,
+                1 => &mut self.vel,
+                _ => return Err(lumen_vm::Fault::OutOfBounds),
+            };
+            *a.get_mut(index).ok_or(lumen_vm::Fault::OutOfBounds)? = v;
+            Ok(())
+        }
+    }
+
+    let q = |v: f64| Q16::from_ratio((v * 1000.0) as i32, 1000);
+    let mut state = State {
+        pos: vec![q(0.0), q(0.0), q(0.0), q(0.5), q(0.0), q(0.0)],
+        vel: vec![q(0.1), q(0.0), q(0.0), q(0.2), q(0.0), q(0.0)],
+    };
+
+    let mut m = Machine::new();
+    m.run_sim(&program, Q16::ZERO, &mut NoUniforms, &mut state)
+        .expect("the sim runs");
+
+    let x = |v: Q16| v.0 as f64 / 65536.0;
+    assert!((x(state.pos[0]) - 0.1).abs() < 0.01, "{}", x(state.pos[0]));
+    assert!((x(state.pos[3]) - 0.7).abs() < 0.01, "{}", x(state.pos[3]));
+    // Velocity is untouched by this body.
+    assert!((x(state.vel[0]) - 0.1).abs() < 0.01);
 }

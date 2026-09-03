@@ -1325,18 +1325,24 @@ fn a_sim_iterates_its_own_elements() {
 }
 
 #[test]
-fn an_element_field_must_be_assigned_somewhere_to_be_read() {
-    // Assignment is the declaration: the grammar says fields are "`p.pos`,
-    // `p.vel` and any others the block assigns".
+fn a_field_read_but_never_written_is_state_the_simulation_was_given() {
+    // An element's fields are what the block *mentions*, read or written. A
+    // body that integrates position from velocity without ever assigning
+    // velocity is a complete and ordinary simulation: the velocities were set
+    // when the elements were created and persist in the broadcast array.
+    //
+    // The cost is real and worth stating: a misspelled field is no longer an
+    // error, it is a field that reads as whatever the array holds. Requiring an
+    // assignment would catch the typo and forbid the simulation, which is the
+    // worse trade - one is a wrong colour, the other is a thing that cannot be
+    // written at all.
     let es = sim_complaints(
         "swarm(count = 8)",
-        "    foreach p in swarm {\n      p.vel = p.heading\n    }",
+        "    foreach p in swarm {
+      p.pos = p.pos + p.vel
+    }",
     );
-    assert!(
-        es.iter()
-            .any(|e| e == "no element field `heading` is assigned in this sim"),
-        "{es:?}"
-    );
+    assert!(es.is_empty(), "{es:?}");
 }
 
 #[test]
@@ -1388,11 +1394,16 @@ fn branches_inside_a_sim_are_checked() {
     // data-dependent control flow - so this is the only place it can be wrong.
     let es = sim_complaints(
         "swarm(count = 8)",
-        "    foreach p in swarm {\n      if p.vel > 1 {\n        p.vel = p.nope\n      } else {\n        p.vel = 0\n      }\n    }",
+        "    foreach p in swarm {
+      if p.vel > 1 {
+        p.vel = nowhere
+      } else {
+        p.vel = 0
+      }
+    }",
     );
     assert!(
-        es.iter()
-            .any(|e| e == "no element field `nope` is assigned in this sim"),
+        es.iter().any(|e| e.contains("unknown name `nowhere`")),
         "{es:?}"
     );
 }

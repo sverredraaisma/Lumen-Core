@@ -476,6 +476,17 @@ pub struct ResolvedSim {
     pub name: String,
     pub count: u32,
     pub has_pos: bool,
+    /// The element's fields, `pos` first and the rest sorted.
+    ///
+    /// Carried from `resolve` rather than recomputed in `emit`, because the two
+    /// disagreeing is a real bug and was one: the emitter collected only
+    /// *assigned* fields while the resolver counted mentioned ones, so a body
+    /// reading `p.vel` without writing it resolved and then silently failed to
+    /// emit.
+    ///
+    /// `pos` first because the accessors are compiled separately and measure
+    /// against array 0; the rest sorted so two compilations agree.
+    pub fields: Vec<String>,
 }
 
 impl Resolved<'_> {
@@ -1374,14 +1385,19 @@ fn declare_sim(r: &mut Resolver<'_>, sim: &Sim) -> ResolvedSim {
         },
     );
 
+    let mut ordered: Vec<String> = fields.iter().cloned().collect();
+    if let Some(at) = ordered.iter().position(|f| f == "pos") {
+        ordered.swap(0, at);
+    }
+
     ResolvedSim {
         name: sim.name.clone(),
         count: count.unwrap_or(0),
-        // A body declares its fields by assigning them. An empty body declares
-        // a simulation this device only reads, and elements of one have
-        // positions by definition - a position is what an accessor measures
-        // against, and there is no body to say otherwise.
+        // An empty body declares a simulation this device only reads, and
+        // elements of one have positions by definition - a position is what an
+        // accessor measures against, and there is no body to say otherwise.
         has_pos: sim.body.is_empty() || fields.contains("pos"),
+        fields: ordered,
     }
 }
 
@@ -1448,13 +1464,19 @@ fn const_number(e: &Expr) -> Option<f64> {
     }
 }
 
-/// Every `p.field` an assignment targets, anywhere in the body.
+/// Every element field the body mentions, read or written.
+///
+/// Written *or read*: a field like `vel` is state that persists in the broadcast
+/// array between frames, so a body that integrates position from velocity
+/// without ever assigning velocity is a complete and ordinary simulation. An
+/// earlier version collected only assignments and refused exactly that.
 fn collect_fields(stmt: &SimStmt, out: &mut alloc::collections::BTreeSet<String>) {
     match stmt {
         SimStmt::Assign(a) => {
             if let Some((_, field)) = assigned_field(a) {
                 out.insert(field.to_string());
             }
+            collect_read_fields(&a.value, out);
         }
         SimStmt::If {
             then, otherwise, ..
@@ -1468,7 +1490,41 @@ fn collect_fields(stmt: &SimStmt, out: &mut alloc::collections::BTreeSet<String>
                 collect_fields(s, out);
             }
         }
-        SimStmt::Let(_) => {}
+        SimStmt::Let(b) => collect_read_fields(&b.value, out),
+    }
+}
+
+/// Every `x.field` an expression reads.
+///
+/// Over-collects: a `vec3`'s `.x` lands here too. Harmless, because the set is
+/// only ever asked whether a name is in it and `x`, `y` and `z` are not names an
+/// element field can shadow into existence - an element only has the fields the
+/// block mentions, and mentioning `.x` of something else does not make one.
+fn collect_read_fields(e: &Expr, out: &mut alloc::collections::BTreeSet<String>) {
+    match &e.kind {
+        ExprKind::Field { base, field } => {
+            if matches!(base.kind, ExprKind::Ident(_)) {
+                out.insert(field.clone());
+            }
+            collect_read_fields(base, out);
+        }
+        ExprKind::Call { args, .. } => {
+            for a in args {
+                collect_read_fields(a, out);
+            }
+        }
+        ExprKind::MethodCall { base, args, .. } => {
+            collect_read_fields(base, out);
+            for a in args {
+                collect_read_fields(a, out);
+            }
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_read_fields(lhs, out);
+            collect_read_fields(rhs, out);
+        }
+        ExprKind::Unary { operand, .. } => collect_read_fields(operand, out),
+        _ => {}
     }
 }
 

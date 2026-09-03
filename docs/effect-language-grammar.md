@@ -269,12 +269,21 @@ accumulation over the elements costable before an effect ships. A `count` of
 zero is refused: a simulation with no elements has nothing for an accessor to
 sum over.
 
-**A field exists if the block assigns it anywhere.** The grammar says an
-element's fields are "`p.pos`, `p.vel` and any others the block assigns", so
-assignment is the declaration. They are collected across the whole body before
-any statement is checked, so a field assigned late is readable early — which is
-exactly what a simulation that updates velocity from position and then position
-from velocity needs.
+**A field exists if the block mentions it, read or written.** The grammar says
+an element's fields are "`p.pos`, `p.vel` and any others the block assigns", and
+assignment alone turned out to be too narrow: a body that integrates position
+from velocity without ever assigning velocity is a complete and ordinary
+simulation, because the velocities were set when the elements were created and
+persist in the broadcast array between frames. They are collected across the
+whole body before any statement is checked, so a field assigned late is readable
+early — which is what a simulation that updates velocity from position and then
+position from velocity needs.
+
+The cost is worth stating: a **misspelled field is not an error**. It is a field
+that reads as whatever the array holds, which is zero for one nobody writes.
+Requiring an assignment would catch the typo at the price of forbidding the
+simulation above, and that is the worse trade — one is a wrong colour, the other
+is a thing that cannot be written at all.
 
 **Open: an element's fields are all `vec3`.** Nothing says what they are typed
 as, and every accessor takes or returns a point or a vector, so that is the
@@ -295,10 +304,22 @@ is receiving, and it is the case the channel form could not serve. Elements of
 such a sim have `pos` by definition: a position is what an accessor measures
 against, and there is no body to say otherwise.
 
-A **non-empty** body is still refused, and the reason is structural rather than
-missing effort. A sim runs in a profile of its own, so compiling one means
-emitting a *second program*, and the program format has `once`, `frame` and
-`pixel` sections with no room for it. That is the piece still to build.
+A **non-empty** body compiles to a *second program*, carried on `Compiled` as
+`sim`. A separate artefact rather than a section of the pixel program, because
+only the sim master ever runs it: shipping one program would mean every device
+carrying code it must never execute, and the profile check that keeps `ASTORE`
+out of a pixel kernel is a property of a whole program rather than of a section.
+
+Its body goes in that program's `frame` section, which is what a sim body is — it
+runs once per frame, on one device. `foreach` unrolls over the count for the same
+reason accessors do. Element fields live one array per field, `pos` in array 0
+because the accessors are compiled separately and measure against it, and the
+rest sorted so two compilations agree.
+
+`if` inside a `sim` is the piece still to build. `MASK_TEST` can express it — it
+skips forward when a register is zero — but a forward skip needs its distance
+patched once the branch is emitted, and doing that carelessly is how a compiler
+starts producing plausible wrong code.
 
 The body is **checked and not yet lowered**. `emit` refuses it, deliberately at
 emission rather than at resolution, so an author still gets every real complaint
