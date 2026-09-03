@@ -512,6 +512,38 @@ pub enum ExprKind {
     },
 }
 
+/// The value of a compile-time constant expression, or `None` if it is not one.
+///
+/// This is the *only* definition of what counts as constant. The emitter folds
+/// parameter defaults with it and the resolver rejects anything it returns
+/// `None` for, so the two cannot drift: before they shared this, a default like
+/// `0.5 * 2` silently compiled to zero, with no diagnostic and no way for an
+/// author to tell.
+///
+/// The width matches the type — one element for a number, three for a colour —
+/// because a parameter default has to fill however many registers the parameter
+/// occupies.
+pub fn const_value(e: &Expr) -> Option<alloc::vec::Vec<f64>> {
+    match &e.kind {
+        ExprKind::Number { value, .. } => Some(alloc::vec![*value]),
+        ExprKind::Color(c) => Some(alloc::vec![c[0], c[1], c[2]]),
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            operand,
+        } => Some(const_value(operand)?.iter().map(|v| -v).collect()),
+        ExprKind::Call { callee, args } if callee == "rgb" || callee == "vec3" => {
+            let mut out = alloc::vec::Vec::new();
+            for a in args {
+                // Each argument contributes its first component, so a nested
+                // colour would be a type error rather than a silent truncation.
+                out.push(*const_value(a)?.first()?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

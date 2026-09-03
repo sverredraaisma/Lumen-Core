@@ -359,8 +359,19 @@ pub mod builder {
             (self.constants.len() - 1) as u16
         }
 
-        /// Bind a channel id to the next slot, returning the slot.
+        /// Bind a channel id to a slot, returning it. Shared like a constant:
+        /// a second mention of the same channel reuses the slot it already has.
+        ///
+        /// The emitter calls this once per *read*, so `rgb(bass, bass, 0)`
+        /// would otherwise take two slots both naming the same channel. That is
+        /// not merely wasteful: a host repointing a program at a different
+        /// channel has to find and rewrite every slot that names the old one,
+        /// and the slot index is a `u8`, so an effect reading one channel 256
+        /// times would silently wrap.
         pub fn channel(&mut self, id: u16) -> u8 {
+            if let Some(i) = self.channels.iter().position(|&c| c == id) {
+                return i as u8;
+            }
             self.channels.push(id);
             (self.channels.len() - 1) as u8
         }

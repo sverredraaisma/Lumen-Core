@@ -670,19 +670,14 @@ impl Emitter<'_, '_> {
     /// Associated rather than a method: it needs nothing from the emitter, and
     /// taking `&self` would borrow the emitter across the recursion for no
     /// reason.
+    /// The folded value of a parameter default.
+    ///
+    /// `resolve` has already rejected anything `const_value` cannot fold, so the
+    /// fallback is unreachable through `compile`. It stays as a zero rather than
+    /// a panic because a compiler that crashes on a malformed tree is worse than
+    /// one that emits a dull colour, and the diagnostic has already been issued.
     fn const_expr_of(e: &Expr) -> Vec<f64> {
-        match &e.kind {
-            ExprKind::Number { value, .. } => alloc::vec![*value],
-            ExprKind::Color(c) => alloc::vec![c[0], c[1], c[2]],
-            ExprKind::Unary {
-                op: UnOp::Neg,
-                operand,
-            } => Self::const_expr_of(operand).iter().map(|v| -v).collect(),
-            ExprKind::Call { callee, args } if callee == "rgb" || callee == "vec3" => {
-                args.iter().map(|a| Self::const_expr_of(a)[0]).collect()
-            }
-            _ => alloc::vec![0.0],
-        }
+        crate::ast::const_value(e).unwrap_or_else(|| alloc::vec![0.0])
     }
 
     /// Inline a user function.

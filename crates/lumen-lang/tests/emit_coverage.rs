@@ -400,28 +400,32 @@ fn mapq_reads_as_zero_until_a_device_is_mapped() {
 }
 
 #[test]
-fn every_mention_of_a_channel_takes_its_own_slot() {
-    // Pinning what the emitter does today. CHREAD names a *slot*, and the slot
-    // table is meant to be what lets a host repoint the program at a different
-    // channel id without recompiling. A slot is allocated per *read*, not per
-    // channel, so two mentions of `bass` produce two slots that both name
-    // channel 0 - and a host repointing it has to find and update both.
+fn every_mention_of_a_channel_shares_one_slot() {
+    // CHREAD names a *slot*, and the slot table is what lets a host repoint a
+    // program at a different channel id without recompiling. A slot per read
+    // rather than per channel meant two mentions of `bass` produced two slots
+    // both naming channel 0: a host had to find and rewrite every one of them,
+    // and the slot index is a `u8`, so an effect reading one channel 256 times
+    // would have wrapped.
     let src = wrap(
-        "  channel bass : audio_bands hold 200 default 0\n  layer l {\n    color = rgb(bass, bass, 0)\n  }",
+        "  channel bass : audio_bands hold 200 default 0
+  layer l {
+    color = rgb(bass, bass, 0)
+  }",
     );
     assert_eq!(
         steps_of(&pixel(&src))[..3],
         [
             (OpCode::ChRead, 18, 0, 0),
-            (OpCode::ChRead, 19, 1, 0),
+            (OpCode::ChRead, 19, 0, 0),
             (OpCode::LoadK, 20, 0, 0),
-        ]
+        ],
+        "both reads name slot 0"
     );
     let bytes = compiled(&src).bytecode;
     let program = Program::parse(&bytes).unwrap();
-    assert_eq!(program.channel_count(), 2, "two mentions, two slots");
+    assert_eq!(program.channel_count(), 1, "one channel, one slot");
     assert_eq!(program.channel_id(0), Some(0));
-    assert_eq!(program.channel_id(1), Some(0), "both name channel 0");
 }
 
 // ---- Operators -------------------------------------------------------------
@@ -773,17 +777,42 @@ fn a_parameter_default_is_folded_component_wise() {
 // ---- Warts pinned so a change to them is deliberate -------------------------
 
 #[test]
-fn a_parameter_default_that_is_not_a_literal_bakes_zero() {
-    // Pinning what the compiler does today, not what it should do. Constant
-    // folding stops at literals, negated literals and `rgb`/`vec3` of those, so
-    // an arithmetic default silently becomes zero and nothing rejects it.
-    let src = wrap("  param p : float = 0.5 * 2 range 0..4\n  layer l { color = rgb(p, 0, 0) }");
-    assert!(errors(&src).is_empty(), "{:?}", errors(&src));
-    assert_eq!(
-        red_at(&src, Q16::ZERO),
-        Q16::ZERO,
-        "the wart changed; if it now folds to 1, that is a fix, not a failure"
+fn a_parameter_default_that_is_not_a_constant_is_refused() {
+    // Constant folding stops at literals, negated literals and `rgb`/`vec3` of
+    // those. An arithmetic default used to become zero silently: the slider sat
+    // in its declared range while the effect rendered as though the parameter
+    // were nothing, with no diagnostic to explain it.
+    let src = wrap(
+        "  param p : float = 0.5 * 2 range 0..4
+  layer l { color = rgb(p, 0, 0) }",
     );
+    let errs = errors(&src);
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("the default for `p` is not a constant"),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn the_defaults_the_emitter_can_fold_are_still_accepted() {
+    // The other half of the same rule: rejecting too much would be worse than
+    // the wart it replaced.
+    for default in ["1.5", "-0.25", "#204080", "rgb(1, 0, 0)", "vec3(0, 1, 0)"] {
+        let ty = if default.starts_with('#') || default.starts_with("rgb") {
+            "color"
+        } else if default.starts_with("vec3") {
+            "vec3"
+        } else {
+            "float"
+        };
+        let range = if ty == "float" { " range -1..2" } else { "" };
+        let src = wrap(&format!(
+            "  param p : {ty} = {default}{range}
+  layer l {{ color = rgb(0, 0, 0) }}"
+        ));
+        assert!(errors(&src).is_empty(), "{default}: {:?}", errors(&src));
+    }
 }
 
 #[test]
@@ -803,13 +832,34 @@ fn a_field_the_register_model_has_no_room_for_reads_the_first_component() {
 }
 
 #[test]
-fn an_assignment_to_a_name_that_is_neither_color_nor_state_emits_nothing() {
-    // The emitter skips it and nothing upstream rejects it, so `other = 1` in a
-    // layer compiles to a program that ignores the line the author wrote.
-    let with = wrap("  layer l {\n    other = 1\n    color = rgb(1, 0, 0)\n  }");
-    let without = wrap("  layer l {\n    color = rgb(1, 0, 0)\n  }");
-    assert!(errors(&with).is_empty(), "{:?}", errors(&with));
-    assert_eq!(compiled(&with).bytecode, compiled(&without).bytecode);
+fn an_assignment_to_a_name_that_is_neither_color_nor_state_is_refused() {
+    // The emitter had nowhere to put it and skipped it in silence, so `other = 1`
+    // compiled to byte-identical bytecode to writing nothing at all. "An unknown
+    // construct is an error, never skipped" is the rule; this was the exception.
+    let src = wrap(
+        "  layer l {
+    other = 1
+    color = rgb(1, 0, 0)
+  }",
+    );
+    let errs = errors(&src);
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("nothing named `other` can be assigned here"),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn assigning_a_declared_state_in_a_layer_is_still_accepted() {
+    let src = wrap(
+        "  state heat : color = rgb(0, 0, 0)
+  layer l {
+    heat = rgb(1, 0, 0)
+    color = heat
+  }",
+    );
+    assert!(errors(&src).is_empty(), "{:?}", errors(&src));
 }
 
 // ---- Diagnostics -----------------------------------------------------------

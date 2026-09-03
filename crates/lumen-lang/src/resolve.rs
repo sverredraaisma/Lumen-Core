@@ -580,6 +580,17 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
                 "add `range lo..hi`; without bounds the parameter cannot be shown as a slider or bound to a MIDI control",
             ));
         }
+        if crate::ast::const_value(&p.default).is_none() {
+            // The emitter folds defaults at compile time, and anything it
+            // cannot fold used to become zero with no diagnostic at all: the
+            // slider would sit at its declared range but the effect would
+            // render as though the parameter were nothing.
+            r.diags.push(Diagnostic::error(
+                p.default.span,
+                alloc::format!("the default for `{}` is not a constant", p.name),
+                "a parameter default is baked in at compile time; write a literal, a colour, or `rgb`/`vec3` of literals",
+            ));
+        }
         if let (Some(unit), ExprKind::Number { unit: lit_unit, .. }) = (p.unit, &p.default.kind) {
             if lit_unit.is_none() {
                 r.diags.push(Diagnostic::warning(
@@ -734,6 +745,31 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
         }
         for a in &layer.assigns {
             let (ty, _) = r.check(&a.value);
+            let is_state = effect.states.iter().any(|st| st.name == a.target);
+            if a.target != "color" && !is_state {
+                // The emitter has nowhere to put this, and skipped it in
+                // silence: `other = 1` compiled to byte-identical bytecode to
+                // writing nothing at all. "An unknown construct is an error,
+                // never skipped" is the rule, and this was the exception.
+                //
+                // The layer modifiers get their own message. Writing
+                // `opacity = x` inside the block is the natural mistake — it
+                // looks like every other line in there — and it is worth saying
+                // where the modifier actually goes rather than that the name
+                // means nothing. A shipped example had exactly this, and its
+                // opacity had never once been applied.
+                let help = match a.target.as_str() {
+                    "opacity" => "`opacity` is a layer modifier, not an assignment: write `layer name opacity <value> { ... }`",
+                    "blend" => "`blend` is a layer modifier, not an assignment: write `layer name blend add { ... }`",
+                    "mask" => "`mask` is a layer modifier, not an assignment: write `layer name mask(name) { ... }`",
+                    _ => "a layer assigns `color`, or a `state` declared on the effect",
+                };
+                r.diags.push(Diagnostic::error(
+                    a.span,
+                    alloc::format!("nothing named `{}` can be assigned here", a.target),
+                    help,
+                ));
+            }
             if a.target == "color" && a.field.is_none() && !matches!(ty, Type::Color | Type::Vec3) {
                 r.diags.push(Diagnostic::error(
                     a.span,
