@@ -615,7 +615,11 @@ fn budget_is_measured_per_invocation_not_cumulatively() {
     });
     let program = Program::parse(&bytes).unwrap();
     let mut m = Machine::new();
-    m.set_budget(5);
+    // Exactly enough for one pass and not a unit more, so a budget that carried
+    // over between pixels would fault on the second one rather than the
+    // thousandth. Taken from the table rather than written as a number: the
+    // weights are calibrated against hardware and move when it is remeasured.
+    m.set_budget(OpCode::Nop.cost());
     for _ in 0..1000 {
         assert!(m
             .run_pixel(&program, &PixelInputs::default(), &mut NoUniforms)

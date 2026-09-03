@@ -258,7 +258,6 @@ impl OpCode {
     /// Checked at load rather than at execution: a `sim` program reaching the
     /// per-pixel path would blow the budget three hundred times a frame, and
     /// finding that out per-pixel is far too late.
-    /// Whether this instruction may appear only in a `sim` program.
     ///
     /// `ALoad` is deliberately absent: a pixel kernel reads the broadcast sim
     /// state to evaluate an accessor. It still cannot write it (`AStore`) or ask
@@ -268,35 +267,112 @@ impl OpCode {
         matches!(self, OpCode::AStore | OpCode::ALen)
     }
 
-    /// Estimated cost in budget units.
+    /// Cost in budget units, where **one unit is 100 ns on the reference
+    /// implementation**: this interpreter on an ESP32-C3 at 160 MHz.
     ///
     /// The compiler multiplies these by LED count and frame rate to answer "will
-    /// this run at 60 fps on that device" before publishing. They are relative
-    /// weights, not cycle counts: table lookups and colour conversions really do
-    /// cost several times a `MOV`, and pretending otherwise would make the
-    /// budget report useless exactly where it matters.
+    /// this run at 60 fps on that device" before publishing, and writes the
+    /// total into the program header. The interpreter then charges the same
+    /// weights as it runs. **Both sides must agree**, which is why these are
+    /// normative and versioned with the ISA rather than a local heuristic: a
+    /// device whose table is dearer than the compiler's would fault a program
+    /// that was promised to fit.
+    ///
+    /// Anchoring the unit to a time rather than to `MOV = 1` is what makes a
+    /// device's capacity computable instead of empirical. A device with a
+    /// 16 667 us frame has 166 670 units to spend, and it can work that out from
+    /// its clock rather than being told.
+    ///
+    /// # These are measured
+    ///
+    /// Spike S2 timed each opcode 64 times per program over 2000 runs, fitting
+    /// the dispatch cost across three program lengths to separate it from the
+    /// operation. The fit gave **837.5 ns per instruction** — 134 cycles — and a
+    /// per-call overhead of only 2 us. That number dominates: dispatch is 80% of
+    /// the cost of an average instruction, so an opcode's weight is mostly the
+    /// fact that it is an instruction at all.
+    ///
+    /// The previous weights were guesses and were wrong in both directions.
+    /// `POW` was priced at 24 units and measures 25 — but so does `SMOOTHSTEP`,
+    /// which was priced at 9; and `LEN2`, priced at 8, is the single most
+    /// expensive instruction in the set at 60, because the fixed-point square
+    /// root iterates. An effect built from distance fields was being promised a
+    /// frame rate it could not hold, while one built from `POW` was refused a
+    /// budget it did not need.
+    ///
+    /// Every weight below was checked against the chip, and all but the control
+    /// transfers are measured directly. A second round caught the two that had
+    /// been interpolated and were wrong: `LOAD_K`, guessed at a `MOV` and
+    /// actually a quarter dearer, and `DOT3`, guessed at 30 and actually 17.
+    ///
+    /// The remaining interpolated weights are the control transfers and the
+    /// emits, which cannot be run 64 times in a row to be timed. They are priced
+    /// at a `MOV` and rounded up: erring dear costs a little admitted work,
+    /// while a weight that errs cheap is a frame the device misses.
+    ///
+    /// # Two things the budget deliberately does not cover
+    ///
+    /// **Per-pixel call overhead**, measured at 1996 ns — about 20 units — for
+    /// entering and leaving the pixel section. A device sizing itself must add
+    /// that per pixel; it is not in any program's budget because it is a
+    /// property of the interpreter, not of the program.
+    ///
+    /// **Instructions a mask skips.** The budget is a static sum, so it is a
+    /// worst case. The one corpus example carrying a `MASK_TEST` measures at 58%
+    /// of its budget, and that is correct behaviour: a device must promise
+    /// against the pixel that runs every layer, not the average one.
     pub const fn cost(self) -> u32 {
         use OpCode::*;
         match self {
-            Nop => 1,
-            Mov | LoadK | Add | Sub | Neg | Abs | Min | Max | Clamp | Floor | Fract => 1,
-            Mul | Madd | Lt | Le | Gt | Ge | Eq | Select | Step | Lerp => 2,
-            Div => 6,
-            SinTurns | CosTurns => 5,
-            Sin | Cos => 7,
-            Sqrt | Len2 => 8,
-            Len3 | Dot3 | SmoothStep => 9,
-            Atan2 | Log | Log2 | Exp => 12,
-            Pow => 24,
-            Noise1 => 10,
-            Noise2 => 18,
-            Noise3 => 28,
-            Hsv2Rgb | Rgb2Hsv | Temp2Rgb | Palette => 12,
-            ChRead | PrevRead | PrevWrite => 2,
-            MaskTest | Repeat | EndRep | Call | Ret | Halt => 1,
-            ALoad | AStore | ALen => 2,
-            Probe => 3,
-            EmitRgb | EmitRgbw | EmitCct => 2,
+            // Dispatch alone, with nothing on top. The floor for every opcode.
+            Nop => 8,
+
+            // Register traffic and control flow, which do little beyond being
+            // dispatched. Control transfers are unmeasured.
+            ChRead => 9,
+            Mov | Floor | Fract | Step | PrevRead | PrevWrite => 10,
+            // Dearer than a `MOV` by the constant-pool indirection, and the
+            // second most common instruction the compiler emits — one example
+            // in the corpus carries fifteen of them — so the two units matter.
+            LoadK => 12,
+            MaskTest | Repeat | EndRep | Call | Ret | Halt => 10,
+            EmitRgb | EmitRgbw | EmitCct => 10,
+            ALoad | AStore | ALen => 12,
+
+            // Single-cycle arithmetic. Comparisons and selects are unmeasured
+            // and priced with `Add`, which is the shape they compile to.
+            Add | Sub | Neg | Abs | Min | Max | Clamp => 11,
+            Lt | Le | Gt | Ge | Eq | Select => 11,
+            Mul => 12,
+            Madd | Lerp | Noise1 => 13,
+
+            // Table-driven transcendentals. Cheaper than they look: the tables
+            // are small enough to stay resident, so most of the cost is the
+            // dispatch every instruction pays.
+            SinTurns | CosTurns | Hsv2Rgb => 15,
+            Log | Log2 | Exp => 17,
+            Noise2 => 19,
+            Div => 22,
+            Temp2Rgb => 23,
+            Sin | Cos => 24,
+            Pow | SmoothStep => 25,
+            Atan2 => 27,
+            Noise3 => 29,
+            Palette => 33,
+            Rgb2Hsv => 38,
+
+            // Three multiplies and two adds with no square root, so it sits far
+            // from the lengths below despite the shared shape. Measured: an
+            // earlier guess of 30 was nearly twice the truth, which is the
+            // argument for measuring rather than reasoning about these.
+            Dot3 => 17,
+
+            // The iterative fixed-point square root, and the two lengths built
+            // on it. By a wide margin the most expensive thing in the ISA, and
+            // previously the most underpriced.
+            Probe => 12,
+            Sqrt => 57,
+            Len2 | Len3 => 60,
         }
     }
 }

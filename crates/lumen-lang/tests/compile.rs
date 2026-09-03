@@ -50,6 +50,28 @@ effect "solid" {
 
 // ---- The pipeline works ----------------------------------------------------
 
+/// The opcodes a source compiles to, in order, for one section.
+///
+/// Several tests here are about the *shape* of what the compiler emits — that a
+/// value was hoisted, that an argument was evaluated once. Asserting that
+/// through the budget number was always indirect, and stopped working when the
+/// weights were calibrated against hardware: the budget deliberately cannot tell
+/// a `MOV` from a `NOISE1` any more, because on the reference chip they very
+/// nearly cost the same. Reading the opcodes says what the test means.
+fn opcodes(src: &str, section: lumen_vm::program::Section) -> Vec<lumen_vm::isa::OpCode> {
+    let (bytes, _) = build(src);
+    let program = lumen_vm::program::Program::parse(&bytes).expect("compiles");
+    (0..program.section_len(section))
+        .filter_map(|i| program.instruction(section, i))
+        .map(|i| i.op)
+        .collect()
+}
+
+/// How many times one opcode appears in a section.
+fn count_of(src: &str, section: lumen_vm::program::Section, op: lumen_vm::isa::OpCode) -> usize {
+    opcodes(src, section).iter().filter(|&&o| o == op).count()
+}
+
 #[test]
 fn the_simplest_effect_compiles_and_renders() {
     let out = render(SOLID, PixelInputs::default(), Q16::ZERO);
@@ -218,10 +240,14 @@ effect "hoist" {
         "nothing was hoisted into `frame`"
     );
     // The pixel section should be doing almost nothing: three moves and an emit.
+    // Asserted as "the transcendental is not in there", which is the actual
+    // claim, rather than as a budget threshold that moves whenever the weights
+    // are remeasured.
+    let pixel = opcodes(src, lumen_vm::program::Section::Pixel);
     assert!(
-        report.instructions_per_pixel < 12,
-        "pixel section costs {}, so the sin was not hoisted",
-        report.instructions_per_pixel
+        !pixel.contains(&lumen_vm::isa::OpCode::SinTurns)
+            && !pixel.contains(&lumen_vm::isa::OpCode::Sin),
+        "the sin is still in the pixel section: {pixel:?}"
     );
 }
 
@@ -691,8 +717,14 @@ effect "costly" {
 "#,
     )
     .1;
+    // Twice, not three times. The weights are measured now, and the measurement
+    // says the interpreter is dispatch-bound: 837 ns of every instruction is the
+    // dispatch every instruction pays, so even `NOISE3` is only about 3.6 times
+    // a `NOP`. The old table's spreads were guesses that flattered the
+    // transcendentals, and a ratio test calibrated against them was really
+    // testing the guess.
     assert!(
-        costly.instructions_per_pixel > cheap.instructions_per_pixel * 3,
+        costly.instructions_per_pixel > cheap.instructions_per_pixel * 2,
         "cheap {} vs costly {}",
         cheap.instructions_per_pixel,
         costly.instructions_per_pixel
@@ -935,30 +967,40 @@ effect "x" {
 fn an_argument_expression_is_evaluated_once_however_often_it_is_used() {
     // The parameter is mentioned three times in the body; the caller's argument
     // must still be computed once.
-    let once = build(
-        r#"
+    const CALL: &str = r#"
 lumen 1
 effect "a" {
   fn thrice(v : float) -> float { return v + v + v }
   layer base { color = rgb(thrice(noise1(u)), 0, 0) }
 }
-"#,
-    )
-    .1;
-    let thrice = build(
-        r#"
+"#;
+    const INLINE: &str = r#"
 lumen 1
 effect "b" {
   layer base { color = rgb(noise1(u) + noise1(u) + noise1(u), 0, 0) }
 }
-"#,
-    )
-    .1;
-    assert!(
-        once.instructions_per_pixel < thrice.instructions_per_pixel,
-        "argument was evaluated more than once: {} vs {}",
-        once.instructions_per_pixel,
-        thrice.instructions_per_pixel
+"#;
+    let pixel = lumen_vm::program::Section::Pixel;
+    let noise = lumen_vm::isa::OpCode::Noise1;
+
+    // Counted, not priced. The budget cannot answer this any more: the call form
+    // emits three redundant `MOV`s across the call boundary, and under weights
+    // measured on hardware those moves cost slightly *more* than the two
+    // `NOISE1`s they save. That is a real inefficiency in the emitter and worth
+    // fixing, but it is not what this test is about, and letting it decide the
+    // result would mean the test passes or fails on register allocation rather
+    // than on whether the argument was evaluated once.
+    assert_eq!(
+        count_of(CALL, pixel, noise),
+        1,
+        "the argument was evaluated more than once"
+    );
+    assert_eq!(
+        count_of(INLINE, pixel, noise),
+        3,
+        "three separate calls should be three evaluations; if this drops to one, \
+         common-subexpression elimination has appeared and this test no longer \
+         contrasts anything"
     );
 }
 
@@ -1131,11 +1173,13 @@ fn unused_stdlib_functions_cost_nothing() {
     // The whole library is linked in; only what is called may reach the
     // bytecode, or every effect would carry hundreds of instructions it never
     // executes.
-    let bare = build(SOLID).1;
+    // Counted rather than priced: the claim is that hundreds of unreachable
+    // instructions are absent, and a count says that directly at any scale of
+    // weights.
+    let bare_ops = opcodes(SOLID, lumen_vm::program::Section::Pixel).len();
     assert!(
-        bare.instructions_per_pixel < 20,
-        "an effect calling no stdlib function cost {}",
-        bare.instructions_per_pixel
+        bare_ops < 12,
+        "an effect calling no stdlib function emitted {bare_ops} instructions"
     );
 }
 

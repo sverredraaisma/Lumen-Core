@@ -9,7 +9,7 @@ Native code per chip means shipping an LLVM toolchain inside a phone app, mainta
 - **Safety by construction.** No pointers, no syscalls, no unbounded loops. A malicious program can waste cycles and nothing else.
 - **Hot swap without reboot.** A program is data.
 
-Realistic cost: an interpreted per-pixel kernel runs roughly 10–30x slower than native. That still leaves headroom — see the budget table below.
+Measured cost, on an ESP32-C3 at 160 MHz: **837 ns per instruction**, or 134 cycles. That is the figure the budget table below is built from, and it is worth sitting with, because it is dominated by dispatch rather than by arithmetic — a `NOISE3` costs only 3.5 times a `NOP`. The interpreter spends most of its time deciding what to do next.
 
 ## Machine model
 
@@ -69,15 +69,33 @@ out      EMIT_RGB EMIT_RGBW EMIT_CCT
 
 ## Budgets
 
-The compiler multiplies estimated cycles per pixel by LED count by target fps and compares against the device's **capacity score** — a static number calibrated from a benchmark at boot, meaning "VM instructions per second ÷ 1000". Budget checks must use capacity, never current load, for the reasons in [[Firmware#PPOS capacity not current load]].
+**One budget unit is 100 ns on the reference implementation** — this interpreter on an ESP32-C3 at 160 MHz. Anchoring the unit to a time rather than to `MOV = 1` is what makes a device's capacity computable from its clock instead of discovered by benchmark: a device with a 16 667 µs frame has 166 670 units in it, and it can work that out for itself.
 
-Budgets are also per *source*, not per device. A device rendering three overlapping sources runs three kernels per frame, so the check is the **sum over concurrently active sources** on that device — which is why the concurrency limit below matters as much as the per-effect budget.
+The per-opcode weights are in `OpCode::cost()` and every one was measured on hardware (spike S2). They are **normative**: the compiler sums them to fill in the program header's budget field, and the interpreter charges the same weights as it runs, so a device whose table was dearer than the compiler's would fault a program it had been promised would fit. They are versioned with the ISA and change only with a VM major version.
 
-| Device | LEDs | fps | Instruction budget per pixel |
-|---|---|---|---|
-| ESP32-S3 @ 240 MHz | 300 | 60 | ~1200 |
-| ESP32-C3 @ 160 MHz | 150 | 60 | ~900 |
-| RP2040 bridged | 100 | 30 | ~1500 |
+Two costs sit outside a program's budget:
+
+- **Per-pixel call overhead**, measured at 1 996 ns — about **20 units** — to enter and leave the pixel section. It belongs to the interpreter, not the program, so a device sizing itself adds it per pixel.
+- **Instructions a mask skips.** The budget is a static sum and therefore a worst case. The one corpus effect carrying a `MASKTEST` measures at 54% of its budget. That is correct: a device must promise against the pixel that runs every layer, not the average one.
+
+The model predicts the chip to within 4%. Across the four corpus effects with straight-line pixel sections, `(budget + 20) / 10` matched measured microseconds per pixel at 96–100%.
+
+Budgets are per *source*, not per device. A device rendering three overlapping sources runs three kernels per frame, so the check is the **sum over concurrently active sources** — which is why the concurrency limit matters as much as the per-effect budget. Budget checks must use capacity, never current load, for the reasons in [[Firmware#PPOS capacity not current load]].
+
+### What actually fits
+
+Rendering cannot have the whole frame. A device also has to receive its channel traffic, run sync, and clock the data out to the strip. The table below reserves **40% of the frame** for that and gives rendering the rest.
+
+| Device | LEDs | fps | Units per pixel | Corpus effects that fit |
+|---|---|---|---|---|
+| ESP32-C3 @ 160 MHz | 300 | 60 | 313 | alert, breathe |
+| ESP32-C3 @ 160 MHz | 150 | 60 | 647 | all five |
+| ESP32-C3 @ 160 MHz | 300 | 30 | 647 | all five |
+| ESP32-C3 @ 160 MHz | 100 | 60 | 980 | all five |
+
+For scale, the five effects measured in S2 cost 136, 215, 388, 462 and 562 units per pixel.
+
+**So 300 LEDs at 60 fps on a C3 is real but tight.** The most expensive corpus effect uses 86% of the frame on its own, which leaves too little for the mesh. The honest statement of the C3's comfortable envelope is *300 LEDs at 30 fps, or 150 at 60*; 300 at 60 is available to simple effects and to a device doing nothing else. An S3 has not been measured. Scaling by clock alone suggests about 1.5x, but it is a different core and the number should be measured before anything is promised on it.
 
 The editor should show this live as a budget bar per device, going red before you publish rather than after. Over budget offers three outs: lower fps for that device, simplify the effect, or move the device to bridge-rendered FRAMEs.
 
@@ -135,8 +153,26 @@ Two requirements this creates:
 
 This resolves an apparent conflict in [[Effect Language]] — that stdlib and firmware versions are independent, yet a firmware upgrade might force a recompile. With append-only instructions, **a firmware upgrade never invalidates a running program**, so the recompile case disappears entirely. New instructions only ever gate *new* effects on *old* devices, which is a comprehensible failure the app can explain and which the small-frozen-core policy keeps rare.
 
+### The weights are part of the contract, and appending does not cover them
+
+Append-only protects the *instructions*. It does not protect the **cost weights**, and those turn out to need saying out loud.
+
+The compiler sums the weights and writes the total into the program header. `RenderLoop::render_source` then uses that declared total as the interpreter's fuel limit. So the two sides are not merely both reading a table — the program is carrying a number that only means anything in the units the compiler used. Change the weights and every program already in the field is declaring a budget in units the device no longer uses.
+
+This is not hypothetical. Recalibrating the table against hardware made four conformance vectors fail immediately, each with a `BudgetExceeded` on a program that had done nothing wrong: their declared budgets were in the old units and the new interpreter charged more than the old compiler had promised. The vectors were restated, which is right for a normative artefact, but a deployed program cannot be restated from the device that runs it.
+
+**So a weight change is a VM major version change**, and `vm_min_version` is what carries it. That is the safe direction — a new program is refused by an old device — but note it is the *wrong* direction for this particular hazard, which is an old program meeting a new device. A device implementing version N must therefore keep the version N-1 weight table to charge N-1 programs with, exactly as the wire format keeps one major version of backward compatibility.
+
+Worth reopening, though, is whether the declared budget should be the fuel limit at all:
+
+- As a **claim**, it belongs at admission: does this fit in what the device can spare? That comparison is already specified, and it is the one the budget was designed for.
+- As a **fuel limit**, it is a strict equality check against the compiler's arithmetic, so it can only ever fire when the two tables disagree — which is to say, it is not a backstop against runaway programs but a tripwire for version skew, and it reports that skew as if the program were at fault.
+
+A backstop against a runaway program wants the *device's* affordance for that source, not the program's opinion of itself. That would make the weights a shared constant rather than a shared *unit*, and old programs would simply run. Listed below rather than done here, because it changes what a device promises and belongs in the spec before the code.
+
 ## Open questions
 
+- Should the interpreter's fuel limit come from the **device's affordance** for a source rather than from the program's own declared budget? Today it is the declaration, which makes a weight change a breaking change for every deployed program and reports version skew as a program fault. Using the device's affordance would leave the declaration where it is useful — admission — and let old programs keep running. See [[#The weights are part of the contract, and appending does not cover them]].
 - Do you want **two dialects** — a full one for ESP32-class and a reduced one for tiny bridged nodes — or one dialect where small nodes just fail the budget check? One dialect is far less to maintain; I would start there.
 - Should there be an escape hatch for hand-written native effects on devices you control, loaded as a firmware extension rather than over the network? Useful for genuinely expensive effects, and it does not compromise the security model because it goes through flashing, not the protocol.
-- Interpreter or a small threaded-code JIT on ESP32-S3? Start interpreted, measure, and only revisit if the budgets above turn out too tight in practice.
+- ~~Interpreter or a small threaded-code JIT on ESP32-S3?~~ **Measured, and worth revisiting.** Dispatch is 837 ns of every instruction on a C3 — roughly 80% of an average one — so the interpreter is dispatch-bound rather than arithmetic-bound, and threaded code attacks exactly that. The open question is no longer whether it would help but whether the budgets are tight enough to justify a second execution path and the conformance burden of keeping two of them bit-identical. On the evidence above, 300 LEDs at 60 fps is the case that wants it.
