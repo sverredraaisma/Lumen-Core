@@ -59,6 +59,13 @@ pub struct Compiled {
 }
 
 /// Compile a resolved effect.
+/// The array a sim's element positions occupy.
+///
+/// Flat `q16` addressed by `(array, index)`, so element *k* has its position at
+/// `3k`, `3k+1`, `3k+2`. One array per field keeps the addressing a multiply and
+/// an add, and lets a simulation broadcast only the fields its accessors read.
+const SIM_POS_ARRAY: u8 = 0;
+
 pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled> {
     let mut e = Emitter {
         r: resolved,
@@ -83,10 +90,25 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
     // hides all of them. What is missing is code generation, and this is where
     // code generation says so.
     for sim in &resolved.effect.sims {
+        // An **empty** body is a declaration of shape rather than a simulation:
+        // "a simulation of this many elements arrives here". It compiles,
+        // because there is nothing to lower and the accessors only need the
+        // count. That is how a device that *receives* a simulation it does not
+        // run declares what it is receiving - the case a `sim<..>` channel
+        // cannot serve, since it names a record type and carries no count.
+        if sim.body.is_empty() {
+            continue;
+        }
+        // A body needs somewhere to be lowered *to*, and there is nowhere: the
+        // program format has `once`, `frame` and `pixel` sections and a sim runs
+        // in a profile of its own, so compiling one means emitting a second
+        // program that `Compiled` has no room for. That is the structural piece
+        // still missing, and it is why this refusal is about the block rather
+        // than about the accessors, which do lower.
         e.diags.push(Diagnostic::error(
             sim.span,
-            "`sim` blocks are not implemented yet",
-            "the block is checked but cannot be compiled; remove it, or render the effect without it for now",
+            "a `sim` body cannot be compiled yet",
+            "the block is checked, and its accessors work; leave the body empty to declare a simulation this device only reads",
         ));
         e.failed = true;
     }
@@ -258,6 +280,196 @@ impl Emitter<'_, '_> {
             self.move_into(Rate::Pixel, dst, v);
             self.bound.push((l.name.clone(), dst));
         }
+    }
+
+    // ---- sim accessors ----------------------------------------------------
+
+    /// Lower `<sim>.influence(p, r)`, `<sim>.nearest(p)` or `<sim>.field(p)`.
+    ///
+    /// Unrolled over the element count, which is a compile-time constant — the
+    /// reason `ALEN` stayed sim-only is that a trip count read from the array
+    /// would not be costable, and the budget check would stop being exact.
+    ///
+    /// Unrolling rather than looping is deliberate. A `REPEAT` loop keeps the
+    /// program small and needs control flow this emitter has never had; an
+    /// unrolled accumulation is straight-line code it can already produce, and
+    /// its cost lands in `lumen budget` where an author will see it. A per-pixel
+    /// accessor over N elements costs about N times its body, so a handful of
+    /// elements is affordable and sixty-four is not — and the budget check
+    /// refuses the second at compile time rather than letting it stutter.
+    fn sim_accessor(
+        &mut self,
+        rate: Rate,
+        e: &Expr,
+        base: &Expr,
+        method: &str,
+        args: &[Expr],
+    ) -> Option<Val> {
+        let ExprKind::Ident(name) = &base.kind else {
+            self.diags.push(Diagnostic::error(
+                base.span,
+                "an accessor needs a sim to read",
+                "call it on the name of a `sim` block, as in `swarm.nearest(p)`",
+            ));
+            return None;
+        };
+
+        let count = self.sim_count(name, e)?;
+        if !self.r.sim_has_pos(name) {
+            self.diags.push(Diagnostic::error(
+                e.span,
+                alloc::format!("`{name}` has no `pos` field to measure against"),
+                "an accessor measures distance to each element's `pos`; assign one in the sim, as in `p.pos = ...`",
+            ));
+            return None;
+        }
+
+        // The point being asked about, evaluated once however many elements
+        // there are.
+        let point = self.expr(rate, args.first()?)?;
+        if point.width != 3 {
+            return None;
+        }
+
+        match method {
+            "nearest" => self.emit_nearest(rate, point, count),
+            "influence" => {
+                let radius = self.expr(rate, args.get(1)?)?;
+                self.emit_influence(rate, point, radius, count)
+            }
+            "field" => self.emit_field(rate, point, count),
+            _ => None,
+        }
+    }
+
+    /// The element count of `name`, or `None` with a diagnostic already pushed.
+    fn sim_count(&mut self, name: &str, e: &Expr) -> Option<u32> {
+        match self.r.sim_element_count(name) {
+            Some(count) => Some(count),
+            None => {
+                self.diags.push(Diagnostic::error(
+                    e.span,
+                    alloc::format!("`{name}` does not declare how many elements it has"),
+                    "accessors need a bound they can be costed against; declare the simulation with `sim name(count = ..)` in this effect",
+                ));
+                None
+            }
+        }
+    }
+
+    /// `dst = p - pos[k]`, the vector from element `k` to the point.
+    fn emit_offset(&mut self, rate: Rate, point: Val, k: u32) -> Option<Val> {
+        let off = self.temp(3)?;
+        // One index register for all three lanes. Allocating it inside the loop
+        // took three, which with the offset and an accumulator was enough to run
+        // a two-element `influence` out of registers - and registers, not
+        // instructions, are the binding constraint on this VM.
+        let idx = self.temp(1)?;
+        for lane in 0..3u8 {
+            let index = self.constant((k * 3 + lane as u32) as f64);
+            // The index is a value at run time even though it is constant here,
+            // because `ALOAD` takes it in a register.
+            self.push(rate, Instruction::with_imm(OpCode::LoadK, idx.base, index));
+            self.push(
+                rate,
+                Instruction::new(OpCode::ALoad, off.base + lane, SIM_POS_ARRAY, idx.base),
+            );
+            self.push(
+                rate,
+                Instruction::new(
+                    OpCode::Sub,
+                    off.base + lane,
+                    point.base + lane,
+                    off.base + lane,
+                ),
+            );
+        }
+        Some(off)
+    }
+
+    fn emit_nearest(&mut self, rate: Rate, point: Val, count: u32) -> Option<Val> {
+        let best = self.temp(1)?;
+        for k in 0..count {
+            let mark = self.next_temp;
+            let off = self.emit_offset(rate, point, k)?;
+            let d = self.temp(1)?;
+            self.push(rate, Instruction::new(OpCode::Len3, d.base, off.base, 0));
+            if k == 0 {
+                self.push(rate, Instruction::new(OpCode::Mov, best.base, d.base, 0));
+            } else {
+                self.push(
+                    rate,
+                    Instruction::new(OpCode::Min, best.base, best.base, d.base),
+                );
+            }
+            self.release_to(mark);
+        }
+        Some(best)
+    }
+
+    fn emit_influence(&mut self, rate: Rate, point: Val, radius: Val, count: u32) -> Option<Val> {
+        let sum = self.temp(1)?;
+        let zero = self.constant(0.0);
+        self.push(rate, Instruction::with_imm(OpCode::LoadK, sum.base, zero));
+        for k in 0..count {
+            let mark = self.next_temp;
+            let off = self.emit_offset(rate, point, k)?;
+            let d = self.temp(1)?;
+            self.push(rate, Instruction::new(OpCode::Len3, d.base, off.base, 0));
+            // A linear falloff that reaches zero at `radius` and never goes
+            // negative: `max(0, 1 - d/r)`. Smooth enough for light, and three
+            // instructions rather than the six a smoothstep would cost on every
+            // one of `count` iterations.
+            self.push(
+                rate,
+                Instruction::new(OpCode::Div, d.base, d.base, radius.base),
+            );
+            let one = self.constant(1.0);
+            let t = self.temp(1)?;
+            self.push(rate, Instruction::with_imm(OpCode::LoadK, t.base, one));
+            self.push(rate, Instruction::new(OpCode::Sub, d.base, t.base, d.base));
+            self.push(rate, Instruction::with_imm(OpCode::LoadK, t.base, zero));
+            self.push(rate, Instruction::new(OpCode::Max, d.base, d.base, t.base));
+            self.push(
+                rate,
+                Instruction::new(OpCode::Add, sum.base, sum.base, d.base),
+            );
+            self.release_to(mark);
+        }
+        Some(sum)
+    }
+
+    fn emit_field(&mut self, rate: Rate, point: Val, count: u32) -> Option<Val> {
+        let sum = self.temp(3)?;
+        let zero = self.constant(0.0);
+        for lane in 0..3u8 {
+            self.push(
+                rate,
+                Instruction::with_imm(OpCode::LoadK, sum.base + lane, zero),
+            );
+        }
+        for k in 0..count {
+            let mark = self.next_temp;
+            let off = self.emit_offset(rate, point, k)?;
+            // The contribution is the offset itself, so the sum is a vector
+            // pointing away from where the elements are - which is what a flow
+            // field wants. Unweighted: weighting by distance is what
+            // `influence` is for, and doing it here too would make one accessor
+            // two.
+            for lane in 0..3u8 {
+                self.push(
+                    rate,
+                    Instruction::new(
+                        OpCode::Add,
+                        sum.base + lane,
+                        sum.base + lane,
+                        off.base + lane,
+                    ),
+                );
+            }
+            self.release_to(mark);
+        }
+        Some(sum)
     }
 
     // ---- registers --------------------------------------------------------
@@ -630,13 +842,8 @@ impl Emitter<'_, '_> {
                 Some(Val::scalar(v.at(k)))
             }
             ExprKind::Call { callee, args } => self.call(rate, callee, args, e),
-            ExprKind::MethodCall { .. } => {
-                self.diags.push(Diagnostic::error(
-                    e.span,
-                    "sim accessors are not implemented yet",
-                    "remove the sim reference for now",
-                ));
-                None
+            ExprKind::MethodCall { base, method, args } => {
+                self.sim_accessor(rate, e, base, method, args)
             }
             ExprKind::Unary { op, operand } => {
                 let v = self.expr(rate, operand)?;

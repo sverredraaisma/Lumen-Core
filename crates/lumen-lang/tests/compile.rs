@@ -576,7 +576,10 @@ effect "x" {
 }
 "#,
     );
-    assert!(es.iter().any(|e| e.contains("not implemented")), "{es:?}");
+    assert!(
+        es.iter().any(|e| e.contains("cannot be compiled yet")),
+        "{es:?}"
+    );
     assert!(
         es.iter().all(|e| !e.contains("unknown name")),
         "a well-formed sim body was complained about: {es:?}"
@@ -1793,4 +1796,171 @@ fn core_signatures_expose_their_argument_types() {
             sig.name
         );
     }
+}
+
+// ---- Sim accessors, end to end ---------------------------------------------
+
+/// Element positions as the VM sees them: one flat array of `q16`, element `k`
+/// at `3k`, `3k+1`, `3k+2`.
+struct Positions(Vec<lumen_vm::q16::Q16>);
+
+impl lumen_vm::vm::Arrays for Positions {
+    fn len(&self, array: u8) -> Option<usize> {
+        (array == 0).then_some(self.0.len())
+    }
+    fn load(&self, array: u8, index: usize) -> Result<lumen_vm::q16::Q16, lumen_vm::Fault> {
+        if array != 0 {
+            return Err(lumen_vm::Fault::OutOfBounds);
+        }
+        self.0
+            .get(index)
+            .copied()
+            .ok_or(lumen_vm::Fault::OutOfBounds)
+    }
+    fn store(
+        &mut self,
+        _array: u8,
+        _index: usize,
+        _value: lumen_vm::q16::Q16,
+    ) -> Result<(), lumen_vm::Fault> {
+        Err(lumen_vm::Fault::OutOfBounds)
+    }
+}
+
+/// Compile `src`, then run its pixel section against `positions` at `x`.
+///
+/// The sim's *body* has no lowering, so the effect as a whole is refused - but
+/// the accessor does lower, and this runs what it produced. Emitting directly
+/// rather than through `compile` is what lets the accessor be exercised before
+/// the block around it can be compiled.
+fn run_accessor(src: &str, positions: &[[f64; 3]], x: f64) -> [f64; 3] {
+    use lumen_vm::q16::Q16;
+    use lumen_vm::vm::{Machine, NoUniforms, PixelInputs, PixelOutput};
+
+    // A sim with an empty body is a declaration of shape - "a simulation of
+    // this many elements arrives here" - so the effect compiles and the
+    // accessor lowers, which is what makes this runnable at all.
+    let (compiled, diags) = compile(src);
+    assert!(!diags.has_errors(), "{}", diags.render(src));
+    let compiled = compiled.expect("compiles");
+
+    let program = lumen_vm::program::Program::parse(&compiled.bytecode).expect("parses");
+    let flat: Vec<Q16> = positions
+        .iter()
+        .flat_map(|p| p.iter().map(|v| Q16::from_ratio((v * 1000.0) as i32, 1000)))
+        .collect();
+    let mut arrays = Positions(flat);
+    let mut m = Machine::new();
+    m.run_frame_at(&program, Q16::ZERO, &mut NoUniforms)
+        .expect("frame");
+
+    let u = Q16::from_ratio((x * 1000.0) as i32, 1000);
+    let inputs = PixelInputs {
+        x: u,
+        y: Q16::ZERO,
+        z: Q16::ZERO,
+        lx: u,
+        ly: Q16::ZERO,
+        lz: Q16::ZERO,
+        index: Q16::ZERO,
+        count: Q16::from_int(1),
+        u,
+        uv_x: u,
+        uv_y: Q16::ZERO,
+        prev: [Q16::ZERO; 3],
+    };
+    match m
+        .run_pixel_with(&program, &inputs, &mut NoUniforms, &mut arrays)
+        .expect("pixel")
+    {
+        PixelOutput::Rgb { r, g, b } => [
+            r.0 as f64 / 65536.0,
+            g.0 as f64 / 65536.0,
+            b.0 as f64 / 65536.0,
+        ],
+        other => panic!("expected rgb, got {other:?}"),
+    }
+}
+
+#[test]
+fn nearest_measures_to_the_closest_element() {
+    // Three elements on the x axis. The answer is a distance, so it is checked
+    // against arithmetic done by hand rather than against whatever the emitter
+    // happened to produce.
+    let src = r#"
+lumen 1
+effect "n" {
+  sim swarm(count = 3) {}
+  layer base {
+    let d = swarm.nearest(vec3(u, 0, 0))
+    color = rgb(d, 0, 0)
+  }
+}
+"#;
+    let elements = [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [1.0, 0.0, 0.0]];
+
+    // Sitting on an element: zero.
+    let out = run_accessor(src, &elements, 0.5);
+    assert!(out[0] < 0.01, "on top of an element, got {}", out[0]);
+
+    // Midway between two: a quarter from each.
+    let out = run_accessor(src, &elements, 0.25);
+    assert!(
+        (out[0] - 0.25).abs() < 0.02,
+        "midway between two elements, got {}",
+        out[0]
+    );
+
+    // Past the end: measured to the last one, not wrapped to the first.
+    let out = run_accessor(src, &elements, 0.9);
+    assert!(
+        (out[0] - 0.1).abs() < 0.02,
+        "beyond the last element, got {}",
+        out[0]
+    );
+}
+
+#[test]
+fn influence_sums_and_falls_off_with_distance() {
+    let src = r#"
+lumen 1
+effect "i" {
+  sim swarm(count = 2) {}
+  layer base {
+    let v = swarm.influence(vec3(u, 0, 0), 1)
+    color = rgb(v, 0, 0)
+  }
+}
+"#;
+    let elements = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+
+    // On the first element: full from it, nothing from the far one, which is
+    // exactly a radius away.
+    let out = run_accessor(src, &elements, 0.0);
+    assert!((out[0] - 1.0).abs() < 0.02, "on an element, got {}", out[0]);
+
+    // Midway: half from each, so the sum is one again - which is the property
+    // that makes `influence` usable as a brightness.
+    let out = run_accessor(src, &elements, 0.5);
+    assert!((out[0] - 1.0).abs() < 0.03, "midway, got {}", out[0]);
+}
+
+#[test]
+fn influence_never_goes_negative_beyond_the_radius() {
+    // The falloff is `max(0, 1 - d/r)`, and without the `max` an element well
+    // outside the radius would *subtract* brightness - a light that gets darker
+    // the further you are from something it cannot see.
+    let src = r#"
+lumen 1
+effect "i" {
+  sim swarm(count = 1) {}
+  layer base {
+    let v = swarm.influence(vec3(u, 0, 0), 0.1)
+    color = rgb(v, 0, 0)
+  }
+}
+"#;
+    let out = run_accessor(src, &[[0.0, 0.0, 0.0]], 0.9);
+    assert!(out[0] >= 0.0, "influence went negative: {}", out[0]);
+    assert!(out[0] < 0.01, "far outside the radius, got {}", out[0]);
 }

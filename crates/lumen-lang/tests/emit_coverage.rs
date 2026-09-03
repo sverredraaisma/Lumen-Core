@@ -883,19 +883,18 @@ fn a_string_is_not_a_value() {
 }
 
 #[test]
-fn a_sim_accessor_is_refused_rather_than_quietly_emitting_nothing() {
-    // The grammar accepts it and the emitter cannot lower it yet. Refusing
-    // loudly beats compiling something that does less than the author wrote.
-    // A well-formed accessor. `count` is a field rather than a method, and
-    // calling it as one is caught by the resolver now - a different message
-    // about a different mistake, which would have masked this one.
+fn an_accessor_on_a_sim_channel_is_refused_for_want_of_a_count() {
+    // Accessors lower now, unrolled over the element count - so they need one.
+    // A `sim<..>` channel names a record type and carries no count, so the
+    // bound an accumulation would unroll against is not knowable from it.
+    // Refused by name rather than lowered against a guess.
     let src = wrap(
         "  channel swarm : sim<flock>
   layer l { let a = swarm.nearest(vec3(x, y, z))
     color = rgb(a, 0, 0) }",
     );
     assert!(
-        errors(&src).contains(&"sim accessors are not implemented yet".to_string()),
+        errors(&src).contains(&"`swarm` does not declare how many elements it has".to_string()),
         "{:?}",
         errors(&src)
     );
@@ -1228,20 +1227,20 @@ fn a_point_argument_must_be_three_wide() {
 }
 
 #[test]
-fn a_well_formed_accessor_reaches_the_emitter() {
-    // Which then refuses it, because lowering is not written. The point is that
-    // the refusal comes from the emitter rather than from the type checker: the
-    // program is well formed and the only thing missing is the code.
-    let es = sim_errors("let a = swarm.influence(vec3(x, y, z), 0.5)\n    color = rgb(a, 0, 0)");
+fn a_well_formed_accessor_against_a_declared_sim_compiles() {
+    // The sim block is what exposes the accessors, and it is what declares the
+    // count they unroll over. Still refused overall, because the sim's *body*
+    // has no lowering - but the accessor itself no longer contributes an error.
+    let es = errors(&wrap(
+        "  sim swarm(count = 3) {
+    foreach p in swarm { p.pos = p.pos }
+  }
+  layer l { let a = swarm.nearest(vec3(x, y, z))
+    color = rgb(a, 0, 0) }",
+    ));
     assert!(
-        es.iter()
-            .any(|e| e == "sim accessors are not implemented yet"),
-        "{es:?}"
-    );
-    assert!(
-        !es.iter()
-            .any(|e| e.contains("no accessor") || e.contains("arguments")),
-        "a well-formed accessor was rejected by the type checker: {es:?}"
+        es.iter().all(|e| e.contains("cannot be compiled yet")),
+        "the accessor itself was rejected: {es:?}"
     );
 }
 
@@ -1270,12 +1269,12 @@ fn sim_block_errors(header: &str, body: &str) -> Vec<String> {
 fn sim_complaints(header: &str, body: &str) -> Vec<String> {
     sim_block_errors(header, body)
         .into_iter()
-        .filter(|e| !e.contains("not implemented"))
+        .filter(|e| !e.contains("cannot be compiled yet"))
         .collect()
 }
 
 #[test]
-fn a_well_formed_sim_is_refused_only_for_not_being_implemented() {
+fn a_well_formed_sim_is_refused_only_for_its_body() {
     let es = sim_complaints(
         "swarm(count = 64)",
         "    let drag = 0.99\n    foreach p in swarm {\n      p.vel = p.vel * drag\n      p.pos = p.pos + p.vel\n    }",

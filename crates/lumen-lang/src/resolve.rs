@@ -460,6 +460,37 @@ pub struct Resolved<'a> {
     /// `let` bindings in declaration order, each tagged with its section.
     pub lets: Vec<ResolvedLet>,
     pub stdlib: crate::StdlibVersion,
+    /// Each `sim` block's name, element count, and whether its elements have a
+    /// `pos` field.
+    ///
+    /// Carried here because `emit` needs a bound it can unroll against and a
+    /// field to measure distance to, and both are facts `resolve` established
+    /// while checking the block. Recomputing them in the emitter would be a
+    /// second answer to the same question.
+    pub sims: Vec<ResolvedSim>,
+}
+
+/// What `emit` needs to know about a `sim` block.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ResolvedSim {
+    pub name: String,
+    pub count: u32,
+    pub has_pos: bool,
+}
+
+impl Resolved<'_> {
+    /// The element count of a `sim` declared in this effect.
+    ///
+    /// `None` for a `sim<..>` channel, which names a record type and carries no
+    /// count: the bound an accessor unrolls against is not knowable from one.
+    pub fn sim_element_count(&self, name: &str) -> Option<u32> {
+        self.sims.iter().find(|s| s.name == name).map(|s| s.count)
+    }
+
+    /// Whether a sim's elements carry the `pos` field accessors measure against.
+    pub fn sim_has_pos(&self, name: &str) -> bool {
+        self.sims.iter().any(|s| s.name == name && s.has_pos)
+    }
 }
 
 /// Resolve and type-check the first effect in a file.
@@ -629,6 +660,10 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
             // A simulation is not a number. Typing it as one let
             // `rgb(swarm, 0, 0)` through, which would have emitted whatever
             // register the channel happened to occupy.
+            //
+            // A channel carries no `count`, so its accessors cannot be lowered:
+            // the bound on the accumulation is not knowable here. `emit` says
+            // so by name rather than guessing one.
             ChanType::Sim(_) => Type::Sim,
             _ => Type::Float,
         };
@@ -642,6 +677,14 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
                 index,
             },
         );
+    }
+
+    // Sims are declared before the layers that use their accessors. The body
+    // is checked further down, once everything a statement inside it might
+    // refer to exists.
+    let mut sims = Vec::new();
+    for s in &effect.sims {
+        sims.push(declare_sim(&mut r, s));
     }
 
     // States are readable everywhere a `let` is, at pixel rate: the value is
@@ -892,6 +935,7 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
         symbols: r.symbols,
         lets,
         stdlib,
+        sims,
     })
 }
 
@@ -1305,22 +1349,20 @@ const COUNT: &str = "count";
 /// understood and reported against precisely, and what is missing is code
 /// generation rather than comprehension - which is the right way round for a
 /// construct the formatter already round-trips.
-fn resolve_sim(r: &mut Resolver<'_>, sim: &Sim) {
+/// Declare a sim's name, before anything can refer to it.
+///
+/// Split from the body check because a `sim` is a top-level declaration and a
+/// layer may use its accessors — and layers are resolved first. Declaring the
+/// name here and checking the body afterwards is what lets `swarm.nearest(p)`
+/// in a layer see the `sim swarm` written below it.
+fn declare_sim(r: &mut Resolver<'_>, sim: &Sim) -> ResolvedSim {
     let count = sim_count(r, sim);
 
-    // The element fields, which are whatever the block assigns anywhere in its
-    // body. Collected before anything is checked so a field assigned late is
-    // readable early - which is exactly what a simulation updating velocity
-    // from position and then position from velocity does.
-    r.sim_fields.clear();
+    let mut fields = alloc::collections::BTreeSet::new();
     for stmt in &sim.body {
-        collect_fields(stmt, &mut r.sim_fields);
+        collect_fields(stmt, &mut fields);
     }
 
-    // The sim's own name denotes its elements, so `foreach p in swarm` inside
-    // `sim swarm` iterates them. That is what the accessor table already
-    // implies - `swarm.count` is the element count - and a name meaning one
-    // thing to a loop and another to an accessor would be worse than either.
     r.declare(
         &sim.name,
         Symbol {
@@ -1331,6 +1373,27 @@ fn resolve_sim(r: &mut Resolver<'_>, sim: &Sim) {
             index: count.unwrap_or(0) as usize,
         },
     );
+
+    ResolvedSim {
+        name: sim.name.clone(),
+        count: count.unwrap_or(0),
+        // A body declares its fields by assigning them. An empty body declares
+        // a simulation this device only reads, and elements of one have
+        // positions by definition - a position is what an accessor measures
+        // against, and there is no body to say otherwise.
+        has_pos: sim.body.is_empty() || fields.contains("pos"),
+    }
+}
+
+fn resolve_sim(r: &mut Resolver<'_>, sim: &Sim) {
+    // The element fields, which are whatever the block assigns anywhere in its
+    // body. Collected before anything is checked so a field assigned late is
+    // readable early - which is exactly what a simulation updating velocity
+    // from position and then position from velocity does.
+    r.sim_fields.clear();
+    for stmt in &sim.body {
+        collect_fields(stmt, &mut r.sim_fields);
+    }
 
     let mut local = Vec::new();
     resolve_sim_body(r, sim, &sim.body, &mut local);

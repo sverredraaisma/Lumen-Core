@@ -282,16 +282,50 @@ reading taken. A scalar field is a plausible thing to want and cannot currently
 be written; inferring each field's type from what is assigned to it is the
 obvious answer and needs a second pass that does not exist yet.
 
-**Open: where an accessor's element count comes from when the sim is not local.**
-A `channel x : sim<T>` names a record type and carries no count, so a device
-receiving a simulation it does not itself declare has no compile-time bound for
-the accumulation. Either the channel form grows a count, or accessors are only
-available against a `sim` block the effect declares. Nothing depends on this
-until accessors are lowered.
+**Settled: an accessor's count comes from a `sim` block, and an empty body is
+how a device declares one it only reads.** A `channel x : sim<T>` names a record
+type and carries no count, so it cannot bound an accumulation; an accessor on one
+is refused by name rather than lowered against a guess.
+
+`sim swarm(count = 64) {}` — an empty body — is a **declaration of shape**: "a
+simulation of this many elements arrives here". It compiles, and its accessors
+work, because there is nothing to lower and the accessors only need the count.
+That is how a device that receives a simulation without running it says what it
+is receiving, and it is the case the channel form could not serve. Elements of
+such a sim have `pos` by definition: a position is what an accessor measures
+against, and there is no body to say otherwise.
+
+A **non-empty** body is still refused, and the reason is structural rather than
+missing effort. A sim runs in a profile of its own, so compiling one means
+emitting a *second program*, and the program format has `once`, `frame` and
+`pixel` sections with no room for it. That is the piece still to build.
 
 The body is **checked and not yet lowered**. `emit` refuses it, deliberately at
 emission rather than at resolution, so an author still gets every real complaint
 about what they wrote instead of one blanket refusal that hides them all.
+
+### How an accessor lowers
+
+Unrolled over the element count, which is why that count has to be a
+compile-time constant and why `ALEN` stayed sim-only — a trip count read from the
+array could not be costed, and the budget check would stop being exact.
+
+Unrolling rather than a `REPEAT` loop is a trade worth stating. A loop keeps the
+program small and needs control flow the emitter has never had; an unrolled
+accumulation is straight-line code it can already produce, and its cost lands in
+`lumen budget` where an author will see it. A per-pixel accessor over *N*
+elements costs roughly *N* times its body — three elements is about 685
+instructions per pixel — so a handful is affordable on a C3 and sixty-four is
+not. The budget check refuses the second at compile time rather than letting it
+stutter, which is the same way every other cost in this language is governed.
+
+Element positions occupy **array 0**, flat, with element *k* at `3k`, `3k+1`,
+`3k+2`. One array per field keeps addressing to a multiply and an add, and lets a
+simulation broadcast only the fields its accessors read.
+
+`influence` falls off linearly and is clamped at zero: `max(0, 1 - d/r)`. Without
+the clamp an element outside the radius would *subtract* brightness, which is a
+light that gets darker the further it is from something it cannot see.
 
 ### Is `fps` advisory or binding
 
