@@ -978,28 +978,47 @@ impl Emitter<'_, '_> {
             _ => {}
         }
 
-        // The straightforward one-instruction cases. Each reads its sources and
-        // writes its destination, so reusing the argument scratch is safe as
-        // long as every argument is a scalar AND the destination lands on the
-        // argument that gets moved into it first.
+        // Reusing the argument scratch for the destination saves a register on
+        // every call, and is safe exactly when the destination cannot land on a
+        // register the instruction has still to read.
         //
-        // `smoothstep` is the exception: it follows GLSL, so its value is the
-        // last argument while the destination would land on the first. Reusing
-        // there overwrites `e0` before the instruction reads it - which showed
-        // up as smoothstep falling instead of rising.
-        // Only the arms that emit a SINGLE instruction may reuse the argument
-        // scratch. A multi-instruction sequence allocates further temporaries
-        // that land on the arguments it has still to read - `mod` clobbered its
-        // own divisor that way and returned the dividend.
+        // Two ways it can:
         //
-        // `smoothstep` is excluded for a different reason: it follows GLSL, so
-        // its value is the last argument while the destination lands on the
-        // first, overwriting `e0` before the instruction reads it.
-        let multi_instruction = matches!(
-            callee,
-            "ceil" | "round" | "trunc" | "sign" | "mod" | "tan" | "smoothstep"
-        );
-        let reuses_scratch = vals.iter().all(|v| v.width == 1) && !multi_instruction;
+        // A multi-instruction sequence allocates further temporaries after the
+        // destination, and those land on arguments not yet consumed - `mod`
+        // clobbered its own divisor that way and returned the dividend. Those
+        // forms never reuse.
+        //
+        // The three-operand forms move one argument into the destination and
+        // then read the other two. Reuse is sound when the destination lands on
+        // the argument being moved, because the MOV is then a no-op; it is not
+        // when that argument occupies no scratch of its own - a built-in like
+        // `u`, or a `let` already in a register - because the destination lands
+        // on the NEXT argument instead and the MOV overwrites it before the
+        // operation reads it. That produced `clamp(u, 0.5, 1)` -> `clamp(u, u, 1)`,
+        // `mix(u, 1, 0.5)` -> `mix(u, u, 0.5)` and `select(u, 1, 0)` returning
+        // `u`. Each is right whenever the first argument is itself computed,
+        // which is why the whole example corpus missed it.
+        //
+        // Naming the condition rather than the callees keeps `smoothstep` in the
+        // same rule: it follows GLSL, so its value is the LAST argument, and the
+        // check below excludes it for precisely the same reason.
+        let multi_instruction =
+            matches!(callee, "ceil" | "round" | "trunc" | "sign" | "mod" | "tan");
+        // For the accumulator forms, the two registers the operation reads after
+        // the destination has been written.
+        // Indexed through `get` rather than `[]`: the resolver rejects a wrong
+        // arity before this runs, but a panic here would be a compiler crash
+        // rather than a diagnostic, and this is not the place to bet on that.
+        let reads_after_move: Option<(u8, u8)> = match callee {
+            "smoothstep" => Some((0usize, 1usize)),
+            "clamp" | "mix" | "select" => Some((1usize, 2usize)),
+            _ => None,
+        }
+        .and_then(|(i, j)| Some((vals.get(i)?.base, vals.get(j)?.base)));
+        let reuses_scratch = vals.iter().all(|v| v.width == 1)
+            && !multi_instruction
+            && reads_after_move.is_none_or(|(a, b)| mark != a && mark != b);
         if reuses_scratch {
             self.release_to(mark);
         }
