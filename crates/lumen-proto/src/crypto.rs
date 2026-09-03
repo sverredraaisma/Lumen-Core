@@ -40,8 +40,21 @@ pub const PUBLIC_KEY_LEN: usize = 32;
 pub trait Aead {
     type Error;
 
-    /// Authenticate `associated_data` and, if `encrypt`, encrypt `in_out` in
-    /// place. Returns the tag.
+    /// Authenticate, and if `encrypt` also encrypt `in_out` in place. Returns
+    /// the tag.
+    ///
+    /// **`in_out` is authenticated either way.** The two modes are the same
+    /// primitive with different inputs, not two constructions:
+    ///
+    /// | `encrypt` | associated data | plaintext |
+    /// |---|---|---|
+    /// | `true`  | `associated_data`            | `in_out` |
+    /// | `false` | `associated_data` ‖ `in_out` | empty    |
+    ///
+    /// An implementation that authenticates only `associated_data` when
+    /// `encrypt` is false leaves the payload forgeable while still producing a
+    /// tag that looks valid, which is the failure this paragraph exists to
+    /// prevent. See `wire-format.md` in `lumen-spec`, which is normative.
     fn seal(
         &self,
         nonce: &[u8; NONCE_LEN],
@@ -50,8 +63,10 @@ pub trait Aead {
         encrypt: bool,
     ) -> Result<[u8; TAG_LEN], Self::Error>;
 
-    /// Verify `tag` over `associated_data` and, if `encrypt`, decrypt `in_out`
-    /// in place.
+    /// Verify `tag` and, if `encrypt`, decrypt `in_out` in place.
+    ///
+    /// Takes the same inputs as [`Aead::seal`] in the same arrangement, so a
+    /// tag produced in one mode must not verify in the other.
     ///
     /// Must be constant-time in the tag comparison, and must not leave decrypted
     /// plaintext in `in_out` when verification fails.

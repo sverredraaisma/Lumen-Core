@@ -6,6 +6,7 @@ members = [
     "crates/lumen-lang",
     "crates/lumen-hal",
     "crates/lumen-cli",
+    "crates/lumen-crypto",
 ]
 
 [workspace.package]
@@ -21,3 +22,4 @@ lumen-proto = { version = "0.1.0", path = "crates/lumen-proto" }
 lumen-vm    = { version = "0.1.0", path = "crates/lumen-vm" }
 lumen-lang  = { version = "0.1.0", path = "crates/lumen-lang" }
 lumen-hal   = { version = "0.1.0", path = "crates/lumen-hal" }
+lumen-crypto = { version = "0.1.0", path = "crates/lumen-crypto" }

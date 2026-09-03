@@ -34,10 +34,11 @@ cargo llvm-cov --workspace --summary-only    # coverage; must be >= 95%
 | `lumen-proto` | wire framing and codec. Hand-written; round-trips `lumen-spec` vectors |
 | `lumen-vm` | bytecode interpreter, `pixel` and `sim` profiles |
 | `lumen-lang` | compiler, plus the public AST, edit API and `fmt` the editor drives |
+| `lumen-crypto` | ChaCha20-Poly1305 and Ed25519 behind the `lumen-proto` seam |
 | `lumen-cli` | `lumen` binary: compile, budget, publish, backup |
 
-Dependencies point one way: `hal` ← `proto`/`vm` ← `lang` ← `cli`. Nothing here
-may depend on `lumen-device`.
+Dependencies point one way: `hal` ← `proto`/`vm` ← `lang` ← `cli`, with
+`crypto` ← `proto`. Nothing here may depend on `lumen-device`.
 
 ## Hard rules
 
@@ -48,6 +49,11 @@ may depend on `lumen-device`.
   seams, phases that run standalone. Every new type gets a plain constructor that
   works without I/O, so it can be built in a test in one line.
 - **No `unsafe`.** Crate roots carry `#![forbid(unsafe_code)]`; leave them.
+- **No cryptography in `lumen-proto`.** It defines *what* is authenticated —
+  which bytes, in what order, under what nonce — and nothing else, so it stays
+  dependency-free for third-party controllers. Algorithms live in
+  `lumen-crypto`, which is the only crate here allowed third-party
+  dependencies, and only pure-Rust `no_std` ones with no allocator.
 - **No floating point in shipping code.** `Q16` fixed point, so output is
   bit-identical on every chip in the mesh.
 - **Nothing from `lumen-device` moves in here**, however convenient. Election,

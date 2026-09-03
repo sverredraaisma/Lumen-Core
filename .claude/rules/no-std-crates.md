@@ -3,11 +3,12 @@ paths:
   - "crates/lumen-vm/**/*.rs"
   - "crates/lumen-hal/**/*.rs"
   - "crates/lumen-proto/**/*.rs"
+  - "crates/lumen-crypto/**/*.rs"
 ---
 
 # `no_std`, no allocation, no floats
 
-These three crates run on an ESP32 with no heap available to them. The crate roots
+These crates run on an ESP32 with no heap available to them. The crate roots
 carry `#![no_std]` and `#![forbid(unsafe_code)]`; do not remove either.
 
 - **No `alloc`.** No `Vec`, `String`, `Box`, `HashMap`. Take `&mut [T]` buffers from
@@ -19,6 +20,11 @@ carry `#![no_std]` and `#![forbid(unsafe_code)]`; do not remove either.
 - **No `std::` anything** — that includes `std::net`, `std::time`, `println!`, and
   `dbg!`. Time and sockets arrive through `lumen-hal` traits.
 - Errors are `enum`s that are `Copy`, not boxed trait objects.
+
+`lumen-crypto` is the one crate here with third-party dependencies, and they are
+held to the same bar: pure Rust, `no_std`, no allocator. CI builds it for
+`riscv32imc-unknown-none-elf`, because a host `cargo test` links `std` through
+the test harness and would not notice a dependency quietly pulling it in.
 
 ## Testing these crates
 

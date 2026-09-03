@@ -1,0 +1,39 @@
+[package]
+name = "lumen-crypto"
+description = "ChaCha20-Poly1305 and Ed25519 behind the lumen-proto cryptographic seam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+lumen-proto = { workspace = true }
+
+# Pure Rust, `no_std`, no allocator. That combination is the requirement, not a
+# preference: this has to build for riscv32imc (ESP32-C3/C6) and Xtensa (S3) as
+# well as for a phone and a desktop, and anything with a C dependency or an
+# allocator would rule one of those out.
+#
+# Default features are off deliberately — both crates enable `std` and an
+# allocator by default, and `alloc` here would be a silent regression rather
+# than a build error.
+chacha20poly1305 = { version = "0.10", default-features = false }
+ed25519-dalek = { version = "2", default-features = false }
+
+# The two primitives `chacha20poly1305` is itself built from, needed directly
+# for the authenticated-only tag: its associated data spans two caller slices
+# and the AEAD API takes one contiguous slice, so that tag is streamed rather
+# than assembled. See src/mesh.rs.
+#
+# These MUST stay on the versions `chacha20poly1305` resolves to. If they ever
+# diverge, the one-time key derived here and the one the AEAD derives could come
+# from different implementations of the same function, and the two modes would
+# stop agreeing with each other in a way no test of either alone would show.
+# `the_two_modes_share_one_primitive` in src/mesh.rs is the check.
+chacha20 = { version = "0.9", default-features = false }
+poly1305 = { version = "0.8", default-features = false }
+
+[dev-dependencies]
+hex-literal = "1"

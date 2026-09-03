@@ -24,6 +24,29 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
 
+  no-std:
+    name: builds for a device with no std and no allocator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv32imc-unknown-none-elf
+      - uses: Swatinem/rust-cache@v2
+      # A bare-metal target has no `std` and no allocator to fall back on, so
+      # this fails to link the moment a dependency quietly pulls either in.
+      # `cargo test` on the host cannot catch that: the dev-dependencies and the
+      # test harness bring `std` with them, and every one of these crates then
+      # compiles happily against it.
+      #
+      # riscv32imc is the ESP32-C3 and C6. Xtensa (the S3) needs a forked
+      # toolchain and so is not built here; RISC-V is the preferred part for
+      # exactly that reason, and it catches the same class of regression.
+      - run: cargo build -p lumen-crypto --target riscv32imc-unknown-none-elf
+      - run: cargo build -p lumen-proto --target riscv32imc-unknown-none-elf
+      - run: cargo build -p lumen-vm --target riscv32imc-unknown-none-elf
+      - run: cargo build -p lumen-hal --target riscv32imc-unknown-none-elf
+
   coverage:
     name: coverage >= 95%
     runs-on: ubuntu-latest
