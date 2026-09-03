@@ -621,6 +621,10 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
     for (index, c) in effect.channels.iter().enumerate() {
         let ty = match &c.ty {
             ChanType::Vec3 => Type::Vec3,
+            // A simulation is not a number. Typing it as one let
+            // `rgb(swarm, 0, 0)` through, which would have emitted whatever
+            // register the channel happened to occupy.
+            ChanType::Sim(_) => Type::Sim,
             _ => Type::Float,
         };
         r.declare(
@@ -969,6 +973,18 @@ impl Resolver<'_> {
             }
             ExprKind::Field { base, field } => {
                 let (ty, rate) = self.check(base);
+                // `<sim>.count` is the declared element count, which is a
+                // compile-time constant and the only field a simulation has.
+                if ty == Type::Sim {
+                    if field != "count" {
+                        self.diags.push(Diagnostic::error(
+                            e.span,
+                            alloc::format!("a sim has no field `{field}`"),
+                            "a sim has `.count`; for a value use `.influence(p, r)`, `.nearest(p)` or `.field(p)`",
+                        ));
+                    }
+                    return (Type::Int, Rate::Once);
+                }
                 let ok = matches!(
                     (&ty, field.as_str()),
                     (Type::Vec2, "x" | "y" | "u" | "v")
@@ -989,6 +1005,7 @@ impl Resolver<'_> {
                 let mut arg_types = Vec::new();
                 for a in args {
                     let (t, r) = self.check(a);
+                    self.value_type(t, a.span);
                     arg_types.push(t);
                     rate = rate.max(r);
                 }
@@ -1037,20 +1054,76 @@ impl Resolver<'_> {
                 }
                 (ty, rate)
             }
-            ExprKind::MethodCall { base, args, .. } => {
-                let (_, mut rate) = self.check(base);
+            ExprKind::MethodCall { base, method, args } => {
+                let (base_ty, _) = self.check(base);
+                let mut arg_types = Vec::new();
                 for a in args {
-                    let (_, r) = self.check(a);
-                    rate = rate.max(r);
+                    let (t, _) = self.check(a);
+                    arg_types.push(t);
                 }
-                // Sim accessors are green - they run per pixel against this
-                // device's own coordinates - but sims are not emitted yet, so
-                // resolve() has already reported that.
-                (Type::Float, Rate::Pixel.min(rate.max(Rate::Pixel)))
+
+                if base_ty != Type::Sim {
+                    self.diags.push(Diagnostic::error(
+                        e.span,
+                        alloc::format!("`{}` has no method `{method}`", base_ty.as_str()),
+                        "only a sim has methods; declare one with `channel name : sim<..>`",
+                    ));
+                    return (Type::Float, Rate::Pixel);
+                }
+
+                let Some(sig) = sim_accessor(method) else {
+                    self.diags.push(Diagnostic::error(
+                        e.span,
+                        alloc::format!("a sim has no accessor `{method}`"),
+                        "a sim has `.influence(p, radius)`, `.nearest(p)`, `.field(p)` and `.count`",
+                    ));
+                    return (Type::Float, Rate::Pixel);
+                };
+
+                if args.len() != sig.params.len() {
+                    self.diags.push(Diagnostic::error(
+                        e.span,
+                        alloc::format!(
+                            "`{method}` takes {} arguments, but {} were given",
+                            sig.params.len(),
+                            args.len()
+                        ),
+                        sig.help,
+                    ));
+                } else {
+                    // Checked on width, not on the exact type, because width is
+                    // what the emitter works in: a `color` where a `vec3` is
+                    // wanted is three lanes either way and lowers correctly,
+                    // while a scalar where a point belongs is a silent bug. Core
+                    // functions check only arity, so this is the narrowest rule
+                    // that catches the mistake that would actually miscompile.
+                    for (i, (want, got)) in sig.params.iter().zip(&arg_types).enumerate() {
+                        if got.width() != want.width() {
+                            self.diags.push(Diagnostic::error(
+                                args[i].span,
+                                alloc::format!(
+                                    "argument {} of `{method}` is `{}`, but a `{}` was given",
+                                    i + 1,
+                                    want.as_str(),
+                                    got.as_str()
+                                ),
+                                sig.help,
+                            ));
+                        }
+                    }
+                }
+
+                // Always pixel rate. An accessor is evaluated against *this
+                // pixel's* position, so it cannot be hoisted into the frame
+                // section however constant its arguments look - that is the
+                // whole meaning of the accessors being green.
+                (sig.returns, Rate::Pixel)
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 let (lt, lr) = self.check(lhs);
                 let (rt, rr) = self.check(rhs);
+                self.value_type(lt, lhs.span);
+                self.value_type(rt, rhs.span);
                 let rate = lr.max(rr);
                 let is_compare = matches!(
                     op,
@@ -1191,4 +1264,60 @@ fn calls_itself(f: &FnDecl, all: &[FnDecl]) -> Option<String> {
         }
     }
     reaches(&f.name, &f.body, all, &mut seen)
+}
+
+impl Resolver<'_> {
+    /// Refuse a handle where a value belongs.
+    ///
+    /// A `sim` names something the program asks questions of; it is not itself a
+    /// number, and `rgb(swarm, 0, 0)` would otherwise emit whatever register the
+    /// channel occupied. Core functions check arity and not argument types, so
+    /// without this there is nowhere else it would be caught.
+    ///
+    /// Returns whether the type was usable, so a caller can stop rather than
+    /// pile a second complaint on top of the first.
+    fn value_type(&mut self, ty: Type, span: Span) -> bool {
+        if ty == Type::Sim {
+            self.diags.push(Diagnostic::error(
+                span,
+                "a sim is not a value",
+                "ask it something: `.influence(p, radius)`, `.nearest(p)`, `.field(p)` or `.count`",
+            ));
+            return false;
+        }
+        true
+    }
+}
+
+/// What a sim accessor takes and returns.
+///
+/// The four in the grammar and nothing else. `influence` is the common case and
+/// is a single call rather than a hand-written loop because looping over sixty
+/// four elements per pixel would be unaffordable — it compiles to a bounded
+/// accumulation with the falloff inlined.
+struct SimAccessor {
+    params: &'static [Type],
+    returns: Type,
+    help: &'static str,
+}
+
+fn sim_accessor(name: &str) -> Option<SimAccessor> {
+    Some(match name {
+        "influence" => SimAccessor {
+            params: &[Type::Vec3, Type::Float],
+            returns: Type::Float,
+            help: "`influence(p, radius)` sums the falloff of every element within `radius` of `p`",
+        },
+        "nearest" => SimAccessor {
+            params: &[Type::Vec3],
+            returns: Type::Float,
+            help: "`nearest(p)` is the distance from `p` to the closest element",
+        },
+        "field" => SimAccessor {
+            params: &[Type::Vec3],
+            returns: Type::Vec3,
+            help: "`field(p)` sums the vector contribution of every element at `p`",
+        },
+        _ => return None,
+    })
 }

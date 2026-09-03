@@ -886,8 +886,13 @@ fn a_string_is_not_a_value() {
 fn a_sim_accessor_is_refused_rather_than_quietly_emitting_nothing() {
     // The grammar accepts it and the emitter cannot lower it yet. Refusing
     // loudly beats compiling something that does less than the author wrote.
+    // A well-formed accessor. `count` is a field rather than a method, and
+    // calling it as one is caught by the resolver now - a different message
+    // about a different mistake, which would have masked this one.
     let src = wrap(
-        "  channel swarm : sim<flock>\n  let a = swarm.count(1)\n  layer l { color = rgb(a, 0, 0) }",
+        "  channel swarm : sim<flock>
+  layer l { let a = swarm.nearest(vec3(x, y, z))
+    color = rgb(a, 0, 0) }",
     );
     assert!(
         errors(&src).contains(&"sim accessors are not implemented yet".to_string()),
@@ -1141,4 +1146,110 @@ fn every_form_in_this_file_compiles_to_the_same_bytes_twice() {
         let src = wrap(body);
         assert_eq!(compiled(&src).bytecode, compiled(&src).bytecode, "{body}");
     }
+}
+
+// ---- Sim accessors ---------------------------------------------------------
+//
+// Accessors are the *green* half of `sim`: they run per pixel on every device
+// against its own coordinates, reading state broadcast on a `sim<..>` channel.
+// A device does not have to run the simulation to use them, which is why they
+// can be typed - and eventually emitted - independently of the `sim` block that
+// is still refused.
+
+fn sim_errors(body: &str) -> Vec<String> {
+    errors(&wrap(&format!(
+        "  channel swarm : sim<flock>\n  layer l {{ {body} }}"
+    )))
+}
+
+#[test]
+fn a_sim_is_not_a_number() {
+    // It typed as `float` until now, so this compiled and would have emitted
+    // whatever register the channel happened to occupy.
+    let es = sim_errors("color = rgb(swarm, 0, 0)");
+    assert!(
+        es.iter()
+            .any(|e| e.contains("cannot be used") || e.contains("sim") || e.contains("float")),
+        "{es:?}"
+    );
+}
+
+#[test]
+fn an_unknown_accessor_names_the_ones_that_exist() {
+    let es = sim_errors("color = rgb(swarm.nonsense(u), 0, 0)");
+    assert!(
+        es.iter().any(|e| e == "a sim has no accessor `nonsense`"),
+        "{es:?}"
+    );
+}
+
+#[test]
+fn count_is_a_field_and_not_a_method() {
+    // The mistake is easy to make - the other three are calls - so the message
+    // says which it is rather than that the name is unknown.
+    let es = sim_errors("color = rgb(swarm.count(1), 0, 0)");
+    assert!(
+        es.iter().any(|e| e == "a sim has no accessor `count`"),
+        "{es:?}"
+    );
+}
+
+#[test]
+fn an_unknown_field_says_what_a_sim_has() {
+    let es = sim_errors("color = rgb(swarm.size, 0, 0)");
+    assert!(
+        es.iter().any(|e| e == "a sim has no field `size`"),
+        "{es:?}"
+    );
+}
+
+#[test]
+fn an_accessor_checks_how_many_arguments_it_takes() {
+    let es = sim_errors("color = rgb(swarm.nearest(vec3(x,y,z), 1), 0, 0)");
+    assert!(
+        es.iter()
+            .any(|e| e.contains("`nearest` takes 1 arguments, but 2 were given")),
+        "{es:?}"
+    );
+}
+
+#[test]
+fn a_point_argument_must_be_three_wide() {
+    // The mistake that would miscompile rather than fail: a scalar where a
+    // position belongs reads one lane and silently measures against the wrong
+    // point. Checked on width because width is what the emitter works in - a
+    // `color` here is three lanes and lowers correctly.
+    let es = sim_errors("color = rgb(swarm.nearest(u), 0, 0)");
+    assert!(
+        es.iter()
+            .any(|e| e.contains("argument 1 of `nearest` is `vec3`")),
+        "{es:?}"
+    );
+}
+
+#[test]
+fn a_well_formed_accessor_reaches_the_emitter() {
+    // Which then refuses it, because lowering is not written. The point is that
+    // the refusal comes from the emitter rather than from the type checker: the
+    // program is well formed and the only thing missing is the code.
+    let es = sim_errors("let a = swarm.influence(vec3(x, y, z), 0.5)\n    color = rgb(a, 0, 0)");
+    assert!(
+        es.iter()
+            .any(|e| e == "sim accessors are not implemented yet"),
+        "{es:?}"
+    );
+    assert!(
+        !es.iter()
+            .any(|e| e.contains("no accessor") || e.contains("arguments")),
+        "a well-formed accessor was rejected by the type checker: {es:?}"
+    );
+}
+
+#[test]
+fn methods_belong_to_sims_and_nothing_else() {
+    let es = errors(&wrap("  layer l { color = rgb(u.influence(u), 0, 0) }"));
+    assert!(
+        es.iter().any(|e| e.contains("has no method `influence`")),
+        "{es:?}"
+    );
 }

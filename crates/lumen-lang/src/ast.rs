@@ -140,6 +140,13 @@ pub enum Type {
     Color,
     Palette,
     Curve,
+    /// A simulation's broadcast state, reached through a `sim<..>` channel.
+    ///
+    /// A handle like [`Type::Palette`] and [`Type::Curve`]: it names something
+    /// the program can ask questions of, and is not itself a value. Deliberately
+    /// absent from [`Type::from_str`] — there is no `param x : sim`, because a
+    /// simulation arrives on a channel and nowhere else.
+    Sim,
 }
 
 impl Type {
@@ -161,6 +168,7 @@ impl Type {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Type::Sim => "sim",
             Type::Float => "float",
             Type::Int => "int",
             Type::Bool => "bool",
