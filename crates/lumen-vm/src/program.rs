@@ -215,17 +215,13 @@ impl<'a> Program<'a> {
                         return Err(ProgramError::UnbalancedRepeat);
                     }
                 }
-                OpCode::Call => {
-                    if ins.bc() as usize >= count {
-                        return Err(ProgramError::BadJumpTarget);
-                    }
+                OpCode::Call if ins.bc() as usize >= count => {
+                    return Err(ProgramError::BadJumpTarget);
                 }
-                OpCode::MaskTest => {
-                    // A skip that runs past the end would silently truncate the
-                    // section instead of doing what the author wrote.
-                    if idx + 1 + ins.bc() as usize > count {
-                        return Err(ProgramError::BadJumpTarget);
-                    }
+                // A skip that runs past the end would silently truncate the
+                // section instead of doing what the author wrote.
+                OpCode::MaskTest if idx + 1 + ins.bc() as usize > count => {
+                    return Err(ProgramError::BadJumpTarget);
                 }
                 _ => {}
             }
