@@ -249,8 +249,33 @@ Warnings, all worth having early ([[Desktop Application#Debugging effects]]):
 ## Open questions
 
 - Should `fn` bodies declare their own `channel` requirements, propagating to callers? Convenient, but it makes bandwidth cost non-local. Allow it and surface the propagation in the editor.
-- Is `fps` advisory or binding? Advisory suits an effect that merely prefers a rate; binding would let an effect refuse to run below one. Advisory is probably right, since the frame grid already constrains the options.
 `budget n on <class>` is now settled as an optional declaration — it is what [[Effect Cookbook#This note is generated]] enforces in CI, and it lets a shared effect make a machine-checkable claim about what it costs. Ignored entirely for personal effects.
+
+### Is `fps` advisory or binding
+
+**Settled: advisory.** An effect says what it was designed for; the device runs
+its own frame grid and does not take instructions about it.
+
+Binding was the alternative — letting an effect refuse to run below a rate — and
+it is the wrong shape for this system. A device's frame grid is set by what else
+it is rendering and by what its hardware can do, so an effect that could refuse
+would be refusing on the basis of something it cannot see. An effect built around
+a 60 Hz strobe still runs at 30, and looks wrong, and that is a thing to show an
+author rather than a reason to leave a strip dark.
+
+The declaration was, until now, parsed and formatted and read by nothing at all —
+`fps 30` was silently inert. It now reaches `BudgetReport`, so `lumen budget`
+prints it and a controller choosing a frame grid or an editor choosing a preview
+rate can see what the effect wanted.
+
+It reaches the report rather than the program header deliberately. The header
+carries what a *device* needs in order to execute a program, and a device does
+not need this; putting it there would be a bytecode format change to carry a hint
+nothing at run time reads.
+
+`fps 0` is the one value refused. Almost anything else is somebody's legitimate
+preference, but zero is not a slow effect — it is a mistake, and left alone it
+reaches a controller that divides by it.
 
 ### How a sim accessor reads the sim's elements
 

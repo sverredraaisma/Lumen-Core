@@ -85,6 +85,7 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
         instructions_per_frame: e.frame.iter().map(|i| i.op.cost()).sum(),
         instructions_once: e.once.iter().map(|i| i.op.cost()).sum(),
         registers_used: e.high_water,
+        fps: e.r.effect.fps,
     };
 
     let mut builder = e.builder;

@@ -81,6 +81,20 @@ pub struct BudgetReport {
     pub instructions_once: u32,
     /// Registers the program needs live at its widest point.
     pub registers_used: u8,
+    /// The frame rate the effect asked for, if it named one.
+    ///
+    /// **Advisory.** A device runs its own frame grid and an effect does not get
+    /// to dictate it — what it can do is say what it was designed for, so a
+    /// controller can choose sensibly and an editor can preview at the right
+    /// rate. An effect built around a 60 Hz strobe still runs at 30, and looks
+    /// wrong, and that is a thing to show an author rather than a reason to
+    /// refuse to run.
+    ///
+    /// It reaches here rather than the program header on purpose: the header
+    /// carries what a *device* needs to execute the program, and a device does
+    /// not need this. Putting it there would be a bytecode format change to
+    /// carry a hint nothing at run time reads.
+    pub fps: Option<u32>,
 }
 
 /// Compile source text to bytecode.

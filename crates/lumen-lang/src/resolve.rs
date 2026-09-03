@@ -819,6 +819,18 @@ pub fn resolve<'a>(file: &'a File, diags: &mut Diagnostics) -> Option<Resolved<'
         ));
     }
 
+    // `fps` is advisory, so almost any value is somebody's legitimate
+    // preference and this rejects only the one that cannot be. Zero is not a
+    // slow effect, it is a mistake - and left alone it would reach a controller
+    // dividing by it.
+    if effect.fps == Some(0) {
+        r.diags.push(Diagnostic::error(
+            effect.span,
+            "`fps 0` is not a frame rate",
+            "give the rate the effect was designed for, or remove the line to let the device choose",
+        ));
+    }
+
     // Usage is only known once masks, layers and later bindings have all been
     // checked, so this is settled here rather than at the declaration.
     for l in &mut lets {

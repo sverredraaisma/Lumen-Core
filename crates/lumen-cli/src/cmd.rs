@@ -140,6 +140,12 @@ pub fn check(input: &Path) -> ExitCode {
 }
 
 fn print_report(r: &BudgetReport) {
+    // The rate the effect asked for, when it asked for one. Advisory: it is what
+    // the effect was designed for, not a demand on the device, and a controller
+    // choosing a frame grid wants to see it rather than guess.
+    if let Some(fps) = r.fps {
+        println!("  wants fps : {fps}");
+    }
     println!("  per pixel : {}", r.instructions_per_pixel);
     println!("  per frame : {}", r.instructions_per_frame);
     println!("  registers : {} of 32", r.registers_used);
