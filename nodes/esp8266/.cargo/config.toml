@@ -1,0 +1,8 @@
+[build]
+target = "xtensa-esp8266-none-elf"
+
+[unstable]
+# No prebuilt `core` for this target, so it is compiled from source alongside
+# `panic_abort` - the profile aborts, and a `core` built to unwind would drag in
+# machinery a device has no use for.
+build-std = ["core", "panic_abort"]

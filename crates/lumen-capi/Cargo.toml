@@ -1,0 +1,35 @@
+# The C ABI over the portable core.
+#
+# Exists so a device whose radio has no Rust driver can still be a full member of
+# the mesh: the firmware owns WiFi and the LED output in whatever language its
+# SDK speaks, and links this for the codec and the VM. Rendering then stays
+# bit-identical with every other device, which is the whole reason the VM is
+# fixed point and exactly what a second implementation would lose.
+#
+# Apache, like the rest of `lumen-core`: this is "how to talk to the mesh".
+[package]
+name = "lumen-capi"
+description = "C ABI over the Lumen wire codec and bytecode VM, for firmware in other languages"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+# An `rlib`, so this crate's own tests run on the host - a C ABI nobody tests
+# from Rust is one that breaks silently on a target nobody builds locally.
+#
+# The `staticlib` a device links is `nodes/esp8266/lumen-static`, a separate
+# crate that adds the panic handler. Splitting them is not tidiness: a
+# `#[panic_handler]` in here would collide with the one std brings to the test
+# binary, so a single crate can be tested or linked into firmware but not both.
+crate-type = ["rlib"]
+
+[dependencies]
+lumen-vm = { path = "../lumen-vm", default-features = false }
+lumen-proto = { path = "../lumen-proto" }
+
+[dev-dependencies]
+# The program builder, for constructing test programs. A device never needs it -
+# it only ever reads programs - which is why the dependency above turns it off.
+lumen-vm = { path = "../lumen-vm" }

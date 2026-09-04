@@ -35,6 +35,7 @@ cargo llvm-cov --workspace --summary-only    # coverage; must be >= 95%
 | `lumen-vm` | bytecode interpreter, `pixel` and `sim` profiles |
 | `lumen-lang` | compiler, plus the public AST, edit API and `fmt` the editor drives |
 | `lumen-crypto` | ChaCha20-Poly1305 and Ed25519 behind the `lumen-proto` seam |
+| `lumen-capi` | C ABI over the codec and VM, for firmware in other languages |
 | `lumen-cli` | `lumen` binary: compile, budget, publish, backup |
 
 Dependencies point one way: `hal` ← `proto`/`vm` ← `lang` ← `cli`, with
@@ -62,6 +63,20 @@ Dependencies point one way: `hal` ← `proto`/`vm` ← `lang` ← `cli`, with
 - **Never edit a vendored `stdlib/vN/` file directly.** It is a copy of a
   `lumen-effects` tag; change it there and re-vendor.
 
+## Firmware in other languages
+
+`crates/lumen-capi` is the codec and the VM behind a C ABI, and
+`nodes/esp8266/` builds it as a static library for the ESP8266 — a chip whose
+radio has no Rust driver and will not get one cheaply. The firmware keeps WiFi
+and the LED output in whatever its SDK speaks; linking this keeps *rendering*
+bit-identical with the rest of the mesh, which is the reason the VM is fixed
+point and precisely what a second implementation would lose.
+
+`nodes/esp8266` is outside the workspace: it cross-compiles to a bare Xtensa
+target and carries its own panic handler. `lumen-capi` itself is an `rlib` in the
+workspace and is tested there — a `#[panic_handler]` cannot coexist with the one
+std brings to a test binary, which is why the two are separate crates.
+
 ## Gotchas
 
 > Living section. Add anything that cost real time.
@@ -75,6 +90,10 @@ Dependencies point one way: `hal` ← `proto`/`vm` ← `lang` ← `cli`, with
   switching to `windows-gnu`: that workaround builds, which is why nobody
   revisits it, and it silently costs you coverage because the `windows-gnu`
   toolchain ships no profiler runtime.
+- **The C ABI is tested from Rust, through raw pointers, including the ways C
+  gets it wrong.** A null, a short buffer, misaligned storage, a backwards range:
+  each has a test. There is no borrow checker on the far side of that boundary
+  and no second chance on a device in somebody's ceiling.
 - **`HashMap` iteration order breaks reproducible builds.** The compiler must emit
   byte-identical bytecode for identical input; iterate a `BTreeMap`, or sort
   before emitting.

@@ -1,0 +1,31 @@
+# The static library an ESP8266 firmware links.
+#
+# Nothing but a panic handler and a reference to `lumen-capi`. It exists as its
+# own crate because a `#[panic_handler]` cannot coexist with the one std brings
+# to a test binary, so the C ABI is testable *or* linkable into firmware but not
+# both from one crate.
+#
+# Outside the workspace, like the conformance adapters: it cross-compiles to a
+# bare Xtensa target and `cargo test --workspace` has no business trying.
+[package]
+name = "lumen-esp8266"
+description = "The Lumen core as a static library for ESP8266 firmware"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+lumen-capi = { path = "../../crates/lumen-capi" }
+
+[profile.release]
+# Size, not speed: an ESP-01 has a megabyte of flash and the WiFi blobs have
+# already taken their share of it. `opt-level = "s"` rather than `"z"` because
+# the VM's dispatch loop is the hot path and `z` turns it inside out.
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

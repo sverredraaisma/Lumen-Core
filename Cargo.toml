@@ -5,6 +5,7 @@ members = [
     "crates/lumen-vm",
     "crates/lumen-lang",
     "crates/lumen-hal",
+    "crates/lumen-capi",
     "crates/lumen-cli",
     "crates/lumen-crypto",
 ]
@@ -12,7 +13,7 @@ members = [
 # runner in the sibling `lumen-spec` checkout, and making `cargo test
 # --workspace` need that checkout would put a second repo between a contributor
 # and a green test run. The conformance CI job builds it explicitly.
-exclude = ["adapters/conformance"]
+exclude = ["adapters/conformance", "nodes/esp8266"]
 
 [workspace.package]
 version = "0.1.0"
