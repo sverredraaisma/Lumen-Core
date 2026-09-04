@@ -69,6 +69,13 @@ pub const R_PREV: u8 = 12;
 /// frame has one of these.
 pub const R_DT: u8 = 15;
 
+/// First register a program that does **not** read `dt` may allocate.
+///
+/// [`R_SCRATCH`] for one that does. The compiler picks between them and records
+/// which in the program's flags, so a program that never mentions `dt` keeps the
+/// register rather than paying for a value it does not use.
+pub const R_SCRATCH_NO_DT: u8 = 15;
+
 /// First register not overwritten per pixel.
 ///
 /// Everything from here up survives from `frame` into every pixel, which is what
@@ -382,7 +389,13 @@ impl Machine {
         uniforms: &mut U,
     ) -> Result<(), Fault> {
         self.regs[R_T as usize] = t;
-        self.regs[R_DT as usize] = dt;
+        // Only when the program says it reads `dt`. A program that does not gets
+        // this register as scratch, and writing it every frame would quietly
+        // corrupt anything the `once` section left there - which is the reason
+        // the reservation could not simply be dropped.
+        if program.reads_dt {
+            self.regs[R_DT as usize] = dt;
+        }
         self.run_frame(program, uniforms)
     }
 

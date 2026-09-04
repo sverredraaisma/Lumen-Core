@@ -79,16 +79,18 @@ fn wrap(body: &str) -> String {
 }
 
 // The register layout every listing below is written against: inputs occupy
-// 0..16, the accumulator takes the first three permanents, and scratch starts
+// 0..15, the accumulator takes the first three permanents, and scratch starts
 // immediately above it.
 //
-// `ACCUM` follows `lumen_vm::vm::R_SCRATCH`, which moved up one when `dt` was
-// given a register of its own. It used to share `t`'s, which made it the
-// absolute show time and silently broke every rate-independent effect.
+// `ACCUM` follows `lumen_vm::vm::R_SCRATCH_NO_DT`, because none of these
+// fixtures reads `dt`. An effect that does gives up register 15 to hold it and
+// every listing here shifts up by one — which is the whole point of the flag in
+// the program header: only the programs that ask for `dt` pay for it.
 const R_U: u8 = 8;
 const R_PREV: u8 = 12;
-const ACCUM: u8 = 16;
-const SCRATCH: u8 = 19;
+const R_DT: u8 = 15;
+const ACCUM: u8 = 15;
+const SCRATCH: u8 = 18;
 
 // ---- The three-operand arm, which is where the clobber lived ---------------
 
@@ -189,27 +191,27 @@ fn packing_collapses_onto_the_mark_when_no_source_is_in_the_way() {
         steps_of(&ins),
         [
             // tint, three components.
-            (OpCode::LoadK, 19, 0, 0),
-            (OpCode::LoadK, 20, 1, 0),
-            (OpCode::LoadK, 21, 2, 0),
+            (OpCode::LoadK, 18, 0, 0),
+            (OpCode::LoadK, 19, 1, 0),
+            (OpCode::LoadK, 20, 2, 0),
             // v, three components.
-            (OpCode::LoadK, 22, 0, 0),
-            (OpCode::LoadK, 23, 3, 0),
-            (OpCode::LoadK, 24, 4, 0),
+            (OpCode::LoadK, 21, 0, 0),
+            (OpCode::LoadK, 22, 3, 0),
+            (OpCode::LoadK, 23, 4, 0),
             // The literal zero.
-            (OpCode::LoadK, 25, 2, 0),
+            (OpCode::LoadK, 24, 2, 0),
             // Collapsed back onto 18..20, descending, so r24 and r22 are read
             // before r20 and r19 are written over.
-            (OpCode::Mov, 21, 25, 0),
-            (OpCode::Mov, 20, 23, 0),
+            (OpCode::Mov, 20, 24, 0),
+            (OpCode::Mov, 19, 22, 0),
+            (OpCode::Mov, 15, 18, 0),
             (OpCode::Mov, 16, 19, 0),
             (OpCode::Mov, 17, 20, 0),
-            (OpCode::Mov, 18, 21, 0),
-            (OpCode::EmitRgb, 16, 17, 18),
+            (OpCode::EmitRgb, 15, 16, 17),
         ],
         "{ins:#?}"
     );
-    assert_eq!(registers(&src), 26);
+    assert_eq!(registers(&src), 25);
 }
 
 #[test]
@@ -230,33 +232,33 @@ fn packing_refuses_to_collapse_onto_a_source_it_would_clobber() {
         steps_of(&ins),
         [
             // vec3(x, y, z), packed descending onto the mark.
-            (OpCode::Mov, 21, 2, 0),
-            (OpCode::Mov, 20, 1, 0),
-            (OpCode::Mov, 19, 0, 0),
+            (OpCode::Mov, 20, 2, 0),
+            (OpCode::Mov, 19, 1, 0),
+            (OpCode::Mov, 18, 0, 0),
             // One NEG per component, into fresh registers.
+            (OpCode::Neg, 21, 18, 0),
             (OpCode::Neg, 22, 19, 0),
             (OpCode::Neg, 23, 20, 0),
-            (OpCode::Neg, 24, 21, 0),
             // The binding comes home to the bottom of its own scratch, which
             // is where the vector it was built from used to be. Everything the
             // expression borrowed above it is dead once the value has moved.
+            (OpCode::Mov, 18, 21, 0),
             (OpCode::Mov, 19, 22, 0),
             (OpCode::Mov, 20, 23, 0),
-            (OpCode::Mov, 21, 24, 0),
             // The rgb pack cannot collapse onto 18: that is where `a.x` lives.
-            (OpCode::Mov, 24, 21, 0),
             (OpCode::Mov, 23, 20, 0),
             (OpCode::Mov, 22, 19, 0),
+            (OpCode::Mov, 21, 18, 0),
+            (OpCode::Mov, 15, 21, 0),
             (OpCode::Mov, 16, 22, 0),
             (OpCode::Mov, 17, 23, 0),
-            (OpCode::Mov, 18, 24, 0),
-            (OpCode::EmitRgb, 16, 17, 18),
+            (OpCode::EmitRgb, 15, 16, 17),
         ],
         "{ins:#?}"
     );
     // Still the widest shape the language can express in one binding, and it now
     // leaves eight registers spare rather than two.
-    assert_eq!(registers(&src), 25);
+    assert_eq!(registers(&src), 24);
 }
 
 // ---- Forms that need a contiguous run --------------------------------------
@@ -270,19 +272,19 @@ fn length_of_three_components_packs_them_and_uses_len3() {
     assert_eq!(
         steps_of(&pixel(&src)),
         [
-            (OpCode::Mov, 19, 0, 0),
-            (OpCode::Mov, 20, 1, 0),
-            (OpCode::Mov, 21, 2, 0),
-            (OpCode::Len3, 22, 19, 0),
+            (OpCode::Mov, 18, 0, 0),
+            (OpCode::Mov, 19, 1, 0),
+            (OpCode::Mov, 20, 2, 0),
+            (OpCode::Len3, 21, 18, 0),
+            (OpCode::LoadK, 22, 0, 0),
             (OpCode::LoadK, 23, 0, 0),
-            (OpCode::LoadK, 24, 0, 0),
-            (OpCode::Mov, 21, 24, 0),
             (OpCode::Mov, 20, 23, 0),
             (OpCode::Mov, 19, 22, 0),
+            (OpCode::Mov, 18, 21, 0),
+            (OpCode::Mov, 15, 18, 0),
             (OpCode::Mov, 16, 19, 0),
             (OpCode::Mov, 17, 20, 0),
-            (OpCode::Mov, 18, 21, 0),
-            (OpCode::EmitRgb, 16, 17, 18),
+            (OpCode::EmitRgb, 15, 16, 17),
         ]
     );
 }
@@ -295,19 +297,19 @@ fn noise3_reuses_the_run_it_packed() {
     assert_eq!(
         steps_of(&pixel(&src)),
         [
-            (OpCode::Mov, 21, 2, 0),
-            (OpCode::Mov, 20, 1, 0),
-            (OpCode::Mov, 19, 0, 0),
-            (OpCode::Noise3, 19, 19, 0),
+            (OpCode::Mov, 20, 2, 0),
+            (OpCode::Mov, 19, 1, 0),
+            (OpCode::Mov, 18, 0, 0),
+            (OpCode::Noise3, 18, 18, 0),
+            (OpCode::LoadK, 19, 0, 0),
             (OpCode::LoadK, 20, 0, 0),
-            (OpCode::LoadK, 21, 0, 0),
+            (OpCode::Mov, 15, 18, 0),
             (OpCode::Mov, 16, 19, 0),
             (OpCode::Mov, 17, 20, 0),
-            (OpCode::Mov, 18, 21, 0),
-            (OpCode::EmitRgb, 16, 17, 18),
+            (OpCode::EmitRgb, 15, 16, 17),
         ]
     );
-    assert_eq!(registers(&src), 22);
+    assert_eq!(registers(&src), 21);
 }
 
 #[test]
@@ -319,18 +321,18 @@ fn hsv_converts_in_place_over_the_run_it_packed() {
     assert_eq!(
         steps_of(&pixel(&src)),
         [
+            (OpCode::LoadK, 18, 0, 0),
             (OpCode::LoadK, 19, 0, 0),
-            (OpCode::LoadK, 20, 0, 0),
             // `u` sits below the mark but the saturation does not, so the pack
             // cannot collapse and takes 20..22 instead.
-            (OpCode::Mov, 23, 20, 0),
             (OpCode::Mov, 22, 19, 0),
-            (OpCode::Mov, 21, R_U, 0),
-            (OpCode::Hsv2Rgb, 21, 21, 0),
+            (OpCode::Mov, 21, 18, 0),
+            (OpCode::Mov, 20, R_U, 0),
+            (OpCode::Hsv2Rgb, 20, 20, 0),
+            (OpCode::Mov, 15, 20, 0),
             (OpCode::Mov, 16, 21, 0),
             (OpCode::Mov, 17, 22, 0),
-            (OpCode::Mov, 18, 23, 0),
-            (OpCode::EmitRgb, 16, 17, 18),
+            (OpCode::EmitRgb, 15, 16, 17),
         ]
     );
 }
@@ -343,15 +345,15 @@ fn temp_scales_the_blackbody_colour_by_its_intensity() {
     assert_eq!(
         steps_of(&pixel(&src)),
         [
-            (OpCode::LoadK, 19, 0, 0),
-            (OpCode::Temp2Rgb, 19, 19, 0),
+            (OpCode::LoadK, 18, 0, 0),
+            (OpCode::Temp2Rgb, 18, 18, 0),
+            (OpCode::Mul, 18, 18, R_U),
             (OpCode::Mul, 19, 19, R_U),
             (OpCode::Mul, 20, 20, R_U),
-            (OpCode::Mul, 21, 21, R_U),
+            (OpCode::Mov, 15, 18, 0),
             (OpCode::Mov, 16, 19, 0),
             (OpCode::Mov, 17, 20, 0),
-            (OpCode::Mov, 18, 21, 0),
-            (OpCode::EmitRgb, 16, 17, 18),
+            (OpCode::EmitRgb, 15, 16, 17),
         ]
     );
     // Intensity zero is black however hot the source.
@@ -379,13 +381,13 @@ fn pos_reads_the_position_registers_without_loading_them() {
     assert_eq!(
         steps_of(&ins),
         [
-            (OpCode::Mov, 21, 2, 0),
-            (OpCode::Mov, 20, 1, 0),
-            (OpCode::Mov, 19, 0, 0),
+            (OpCode::Mov, 20, 2, 0),
+            (OpCode::Mov, 19, 1, 0),
+            (OpCode::Mov, 18, 0, 0),
+            (OpCode::Mov, 15, 18, 0),
             (OpCode::Mov, 16, 19, 0),
             (OpCode::Mov, 17, 20, 0),
-            (OpCode::Mov, 18, 21, 0),
-            (OpCode::EmitRgb, 16, 17, 18),
+            (OpCode::EmitRgb, 15, 16, 17),
         ]
     );
 }
@@ -399,13 +401,13 @@ fn mapq_reads_as_zero_until_a_device_is_mapped() {
     assert_eq!(
         steps_of(&pixel(&src)),
         [
+            (OpCode::LoadK, 18, 0, 0),
             (OpCode::LoadK, 19, 0, 0),
             (OpCode::LoadK, 20, 0, 0),
-            (OpCode::LoadK, 21, 0, 0),
+            (OpCode::Mov, 15, 18, 0),
             (OpCode::Mov, 16, 19, 0),
             (OpCode::Mov, 17, 20, 0),
-            (OpCode::Mov, 18, 21, 0),
-            (OpCode::EmitRgb, 16, 17, 18),
+            (OpCode::EmitRgb, 15, 16, 17),
         ]
     );
     assert_eq!(red_at(&src, Q16::ONE), Q16::ZERO);
@@ -428,9 +430,9 @@ fn every_mention_of_a_channel_shares_one_slot() {
     assert_eq!(
         steps_of(&pixel(&src))[..3],
         [
+            (OpCode::ChRead, 18, 0, 0),
             (OpCode::ChRead, 19, 0, 0),
-            (OpCode::ChRead, 20, 0, 0),
-            (OpCode::LoadK, 21, 0, 0),
+            (OpCode::LoadK, 20, 0, 0),
         ],
         "both reads name slot 0"
     );
@@ -450,7 +452,7 @@ fn negation_emits_one_instruction_and_no_constant() {
         steps_of(&pixel(&src))[..1],
         [(OpCode::Neg, SCRATCH, R_U, 0)]
     );
-    assert_eq!(registers(&src), 22);
+    assert_eq!(registers(&src), 21);
 }
 
 #[test]
@@ -542,12 +544,12 @@ fn the_remainder_operator_keeps_the_divisor_it_still_has_to_read() {
     assert_eq!(
         steps_of(&pixel(&src))[..5],
         [
-            (OpCode::LoadK, 19, 0, 0),
+            (OpCode::LoadK, 18, 0, 0),
             // The result register is 19; the divisor stays untouched at 18.
-            (OpCode::Div, 21, R_U, 19),
-            (OpCode::Floor, 21, 21, 0),
-            (OpCode::Mul, 22, 21, 19),
-            (OpCode::Sub, 20, R_U, 22),
+            (OpCode::Div, 20, R_U, 18),
+            (OpCode::Floor, 20, 20, 0),
+            (OpCode::Mul, 21, 20, 18),
+            (OpCode::Sub, 19, R_U, 21),
         ]
     );
     // 0.75 % 0.25 is zero; a clobbered divisor would return the dividend.
@@ -566,9 +568,9 @@ fn a_second_normal_layer_moves_rather_than_composites() {
     assert_eq!(
         steps_of(&ins)[9..],
         [
-            (OpCode::Mov, ACCUM, 19, 0),
-            (OpCode::Mov, ACCUM + 1, 20, 0),
-            (OpCode::Mov, ACCUM + 2, 21, 0),
+            (OpCode::Mov, ACCUM, 18, 0),
+            (OpCode::Mov, ACCUM + 1, 19, 0),
+            (OpCode::Mov, ACCUM + 2, 20, 0),
             (OpCode::EmitRgb, ACCUM, ACCUM + 1, ACCUM + 2),
         ],
         "{ins:#?}"
@@ -592,9 +594,9 @@ fn additive_and_multiplicative_blends_are_one_instruction_per_channel() {
     assert_eq!(
         steps_of(&pixel(&src))[9..12],
         [
+            (OpCode::Add, 15, 15, 18),
             (OpCode::Add, 16, 16, 19),
             (OpCode::Add, 17, 17, 20),
-            (OpCode::Add, 18, 18, 21),
         ]
     );
     match render(&src, PixelInputs::default()) {
@@ -609,9 +611,9 @@ fn additive_and_multiplicative_blends_are_one_instruction_per_channel() {
     assert_eq!(
         steps_of(&pixel(&src))[9..12],
         [
+            (OpCode::Min, 15, 15, 18),
             (OpCode::Min, 16, 16, 19),
             (OpCode::Min, 17, 17, 20),
-            (OpCode::Min, 18, 18, 21),
         ]
     );
 
@@ -620,9 +622,9 @@ fn additive_and_multiplicative_blends_are_one_instruction_per_channel() {
     assert_eq!(
         steps_of(&pixel(&src))[9..12],
         [
+            (OpCode::Max, 15, 15, 18),
             (OpCode::Max, 16, 16, 19),
             (OpCode::Max, 17, 17, 20),
-            (OpCode::Max, 18, 18, 21),
         ]
     );
 
@@ -632,9 +634,9 @@ fn additive_and_multiplicative_blends_are_one_instruction_per_channel() {
     assert_eq!(
         steps_of(&pixel(&src))[9..12],
         [
+            (OpCode::Mul, 15, 15, 18),
             (OpCode::Mul, 16, 16, 19),
             (OpCode::Mul, 17, 17, 20),
-            (OpCode::Mul, 18, 18, 21),
         ]
     );
     match render(&src, PixelInputs::default()) {
@@ -654,12 +656,12 @@ fn difference_is_a_subtract_and_an_absolute_value_per_channel() {
     assert_eq!(
         steps_of(&pixel(&src))[9..15],
         [
+            (OpCode::Sub, 15, 15, 18),
+            (OpCode::Abs, 15, 15, 0),
             (OpCode::Sub, 16, 16, 19),
             (OpCode::Abs, 16, 16, 0),
             (OpCode::Sub, 17, 17, 20),
             (OpCode::Abs, 17, 17, 0),
-            (OpCode::Sub, 18, 18, 21),
-            (OpCode::Abs, 18, 18, 0),
         ]
     );
     // |1 - 0| and |0 - 1| are both one.
@@ -679,11 +681,11 @@ fn screen_is_one_minus_the_product_of_the_complements() {
     assert_eq!(
         steps_of(&pixel(&src))[9..14],
         [
-            (OpCode::LoadK, 22, 0, 0),
-            (OpCode::Sub, 23, 22, 16),
-            (OpCode::Sub, 24, 22, 19),
-            (OpCode::Mul, 23, 23, 24),
-            (OpCode::Sub, 16, 22, 23),
+            (OpCode::LoadK, 21, 0, 0),
+            (OpCode::Sub, 22, 21, 15),
+            (OpCode::Sub, 23, 21, 18),
+            (OpCode::Mul, 22, 22, 23),
+            (OpCode::Sub, 15, 21, 22),
         ]
     );
     match render(&src, PixelInputs::default()) {
@@ -695,7 +697,7 @@ fn screen_is_one_minus_the_product_of_the_complements() {
     // Each channel takes its own scratch and none of it is handed back between
     // channels, so a screen blend is the widest thing an effect can do. This is
     // the guard that says it still fits in the register file - barely.
-    assert_eq!(registers(&src), 31);
+    assert_eq!(registers(&src), 30);
 }
 
 #[test]
@@ -706,12 +708,12 @@ fn overlay_is_a_clamped_double_product() {
     assert_eq!(
         steps_of(&pixel(&src))[9..15],
         [
-            (OpCode::LoadK, 22, 2, 0),
-            (OpCode::Mul, 16, 16, 19),
-            (OpCode::Mul, 16, 16, 22),
-            (OpCode::LoadK, 22, 1, 0),
-            (OpCode::LoadK, 23, 0, 0),
-            (OpCode::Clamp, 16, 22, 23),
+            (OpCode::LoadK, 21, 2, 0),
+            (OpCode::Mul, 15, 15, 18),
+            (OpCode::Mul, 15, 15, 21),
+            (OpCode::LoadK, 21, 1, 0),
+            (OpCode::LoadK, 22, 0, 0),
+            (OpCode::Clamp, 15, 21, 22),
         ]
     );
     // 2 * 1 * 0 is zero, and the clamp keeps it in range.
@@ -721,7 +723,7 @@ fn overlay_is_a_clamped_double_product() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(registers(&src), 28);
+    assert_eq!(registers(&src), 27);
 }
 
 // ---- Constants and palettes ------------------------------------------------
@@ -836,7 +838,7 @@ fn a_field_the_register_model_has_no_room_for_reads_the_first_component() {
     let red = wrap("  layer l {\n    color = rgb(prev.r, 0, 0)\n  }");
     assert!(errors(&alpha).is_empty(), "{:?}", errors(&alpha));
     assert!(
-        steps_of(&pixel(&alpha)).contains(&(OpCode::Mov, 21, R_PREV, 0)),
+        steps_of(&pixel(&alpha)).contains(&(OpCode::Mov, 20, R_PREV, 0)),
         "{:#?}",
         pixel(&alpha)
     );
@@ -1410,4 +1412,66 @@ fn branches_inside_a_sim_are_checked() {
         es.iter().any(|e| e.contains("unknown name `nowhere`")),
         "{es:?}"
     );
+}
+
+// ---- `dt` costs a register, and only for the effects that ask -------------
+
+/// Registers an effect needs, and whether it declared that it reads `dt`.
+fn shape(src: &str) -> (u8, bool) {
+    let bytes = compiled(src).bytecode;
+    let program = Program::parse(&bytes).expect("a program");
+    (registers(src), program.reads_dt)
+}
+
+#[test]
+fn an_effect_that_never_mentions_dt_keeps_the_register() {
+    // The point of the header flag. `dt` needs a register held for it, and
+    // charging every effect for one moved the shipped corpus from a worst case
+    // of 30 registers to 31 and stopped the editor's own sample compiling.
+    // Asserted as "is register 15 available", which is the property, rather
+    // than by comparing two register counts - two different expressions need
+    // different numbers of temporaries, so that comparison would measure the
+    // expressions rather than the reservation.
+    let plain = wrap("  layer l {\n    color = rgb(u, 0, 0)\n  }");
+    let (_, reads) = shape(&plain);
+    assert!(!reads);
+    assert!(
+        steps_of(&pixel(&plain))
+            .iter()
+            .any(|(_, a, _, _)| *a == R_DT),
+        "an effect with no `dt` should be free to allocate register {R_DT}",
+    );
+
+    // And an effect that does read it never writes there, because that is where
+    // the VM is going to put `dt` every frame.
+    let uses = wrap("  layer l {\n    color = rgb(u * dt, 0, 0)\n  }");
+    assert!(shape(&uses).1);
+    assert!(
+        steps_of(&pixel(&uses))
+            .iter()
+            .all(|(_, a, _, _)| *a != R_DT),
+        "register {R_DT} holds `dt` here and must not be allocated over",
+    );
+}
+
+#[test]
+fn an_effect_that_reads_dt_declares_it_and_pays_for_it() {
+    let (_, reads) = shape(&wrap("  layer l {\n    color = rgb(dt, 0, 0)\n  }"));
+    assert!(
+        reads,
+        "the flag is what tells a device to supply `dt` at all"
+    );
+}
+
+#[test]
+fn dt_reached_through_a_binding_still_declares_it() {
+    // The flag comes from what emission actually resolved, not from scanning
+    // the source for a name - so it survives a `let`, an inlined function, or
+    // anything else that puts distance between the mention and the use. A scan
+    // would be a second implementation of "does this read `dt`" and would drift
+    // silently, because being wrong in the safe direction only costs a register
+    // nobody notices.
+    let src = wrap("  let step = dt * 60\n  layer l {\n    color = rgb(step, 0, 0)\n  }");
+    let (_, reads) = shape(&src);
+    assert!(reads);
 }

@@ -25,7 +25,8 @@ use lumen_vm::program::builder::ProgramBuilder;
 use lumen_vm::program::{Section, PALETTE_STOPS};
 use lumen_vm::q16::Q16;
 use lumen_vm::vm::{
-    R_DT, R_I, R_LX, R_LY, R_LZ, R_N, R_PREV, R_SCRATCH, R_T, R_U, R_UV_X, R_X, R_Y, R_Z,
+    R_DT, R_I, R_LX, R_LY, R_LZ, R_N, R_PREV, R_SCRATCH, R_SCRATCH_NO_DT, R_T, R_U, R_UV_X, R_X,
+    R_Y, R_Z,
 };
 
 use crate::ast::*;
@@ -74,8 +75,40 @@ pub struct Compiled {
 /// an add, and lets a simulation broadcast only the fields its accessors read.
 const SIM_POS_ARRAY: u8 = 0;
 
+/// Compile, holding a register for `dt` only if the effect reads one.
+///
+/// The register file is 32 words and the scratch space starts one word higher
+/// when `dt` is live, which is the difference between a two-layer effect with a
+/// mask and a screen blend fitting or not. Most effects never mention `dt`, and
+/// charging all of them for it was measurable: the shipped corpus went from a
+/// worst case of 30 registers to 31, and the editor's own sample stopped
+/// compiling.
+///
+/// Found by emitting once and looking, rather than by walking the AST for the
+/// name. Emission already resolves every builtin through one place, so asking it
+/// what it touched cannot disagree with what it emitted — whereas a separate
+/// scan is a second implementation of "does this read `dt`" that can drift, and
+/// would drift silently, because being wrong in the safe direction just costs a
+/// register nobody notices.
+///
+/// The probe pass throws away its diagnostics: they would otherwise arrive
+/// twice, and the second pass produces the same ones.
 pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled> {
+    let mut probe = Diagnostics::new();
+    let reads_dt = emit_from(resolved, &mut probe, R_SCRATCH).1;
+    let base = if reads_dt { R_SCRATCH } else { R_SCRATCH_NO_DT };
+    emit_from(resolved, diags, base).0
+}
+
+/// `emit`, with the first register the allocator may use, and whether `dt` was
+/// read.
+fn emit_from(
+    resolved: &Resolved<'_>,
+    diags: &mut Diagnostics,
+    base: u8,
+) -> (Option<Compiled>, bool) {
     let mut e = Emitter {
+        reads_dt: false,
         r: resolved,
         diags,
         builder: ProgramBuilder::new(),
@@ -83,10 +116,10 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
         frame: Vec::new(),
         pixel: Vec::new(),
         bound: Vec::new(),
-        next_permanent: R_SCRATCH,
-        temp_floor: R_SCRATCH,
-        next_temp: R_SCRATCH,
-        high_water: R_SCRATCH,
+        next_permanent: base,
+        temp_floor: base,
+        next_temp: base,
+        high_water: base,
         inline_depth: 0,
         failed: false,
         sim_body: Vec::new(),
@@ -123,14 +156,14 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
 
     e.run();
     if e.failed || e.diags.has_errors() {
-        return None;
+        return (None, false);
     }
 
     // After the pixel program, so a failure in the sim body does not lose the
     // diagnostics the layers produced.
     let sim = emit_sim_program(&mut e, resolved);
     if e.failed || e.diags.has_errors() {
-        return None;
+        return (None, false);
     }
 
     let report = BudgetReport {
@@ -141,6 +174,7 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
         fps: e.r.effect.fps,
     };
 
+    let reads_dt = e.reads_dt;
     let mut builder = e.builder;
     for ins in &e.once {
         builder.push(Section::Once, *ins);
@@ -153,12 +187,20 @@ pub fn emit(resolved: &Resolved<'_>, diags: &mut Diagnostics) -> Option<Compiled
     }
     builder.budget = report.instructions_per_pixel;
     builder.graph_hash = graph_hash(resolved);
+    // The flag a device reads to know whether to supply `dt` at all. Without it
+    // the VM would write that register every frame, which is fine for a program
+    // that reserved it and silently destroys a `once`-computed value for one
+    // that did not.
+    builder.reads_dt = reads_dt;
 
-    Some(Compiled {
-        bytecode: builder.build(),
-        report,
-        sim,
-    })
+    (
+        Some(Compiled {
+            bytecode: builder.build(),
+            report,
+            sim,
+        }),
+        reads_dt,
+    )
 }
 
 /// Build the simulation's own program, if the effect declares one with a body.
@@ -226,6 +268,9 @@ fn graph_hash(r: &Resolved<'_>) -> u64 {
 }
 
 struct Emitter<'a, 'd> {
+    /// Whether anything asked for `dt`. Decides a register, and the flag a
+    /// device reads to know whether to supply one.
+    reads_dt: bool,
     r: &'a Resolved<'a>,
     diags: &'d mut Diagnostics,
     builder: ProgramBuilder,
@@ -1303,8 +1348,12 @@ impl Emitter<'_, '_> {
                 "t" => Val::scalar(R_T),
                 // Its own register. Sharing `t`'s made `dt` the absolute show
                 // time, which silently broke every rate-independent effect -
-                // see the note on `R_DT`.
-                "dt" => Val::scalar(R_DT),
+                // see the note on `R_DT`. Recorded, because a program that never
+                // asks for it should not pay a register to hold it.
+                "dt" => {
+                    self.reads_dt = true;
+                    Val::scalar(R_DT)
+                }
                 "pos" => Val {
                     base: R_X,
                     width: 3,

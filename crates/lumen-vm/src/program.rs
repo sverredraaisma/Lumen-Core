@@ -5,7 +5,7 @@
 //! vm_version   u8    minimum VM version this program needs
 //! profile      u8    0 pixel, 1 sim
 //! program_id   u16
-//! flags        u16   bit0 contains probes
+//! flags        u16   bit0 contains probes, bit1 reads `dt`
 //! const_count  u16   Q16 literals
 //! palette_count u8
 //! channel_count u8
@@ -36,6 +36,12 @@ use crate::{Fault, Profile};
 
 /// First four bytes of every program.
 pub const MAGIC: [u8; 4] = *b"LVM\0";
+
+/// `flags` bit 0: the program contains probe instructions.
+pub const FLAG_HAS_PROBES: u16 = 1 << 0;
+
+/// `flags` bit 1: the program reads `dt`, so the VM must supply it.
+pub const FLAG_READS_DT: u16 = 1 << 1;
 
 /// VM version this build implements. A program needing more is refused.
 pub const VM_VERSION: u8 = 1;
@@ -95,6 +101,19 @@ pub struct Program<'a> {
     pub program_id: u16,
     /// True when the program was built with `PROBE` instrumentation.
     ///
+    /// Whether this program reads `dt`, and so needs a register held for it.
+    ///
+    /// Declared rather than assumed, because the register is the scarcest thing
+    /// the VM has. A program that never mentions `dt` gets the full scratch
+    /// file; one that does gives up a register and the compiler allocates
+    /// around it. The difference is a two-layer effect with a mask and a screen
+    /// blend fitting or not fitting.
+    ///
+    /// The VM writes [`crate::vm::R_DT`] **only** when this is set. That is what
+    /// makes the reservation safe to skip: a value computed in `once` can live
+    /// in that register and survive into later frames, and overwriting it every
+    /// frame would corrupt it silently.
+    pub reads_dt: bool,
     /// Explicit because probes cost budget: a normal build contains none, so
     /// debugging never makes the shipped program slower.
     pub has_probes: bool,
@@ -172,7 +191,8 @@ impl<'a> Program<'a> {
             vm_version,
             profile,
             program_id,
-            has_probes: flags & 1 != 0,
+            has_probes: flags & FLAG_HAS_PROBES != 0,
+            reads_dt: flags & FLAG_READS_DT != 0,
             budget,
             graph_hash,
             channels,
@@ -354,6 +374,7 @@ pub mod builder {
         pub program_id: u16,
         pub profile_sim: bool,
         pub has_probes: bool,
+        pub reads_dt: bool,
         pub budget: u32,
         pub graph_hash: u64,
         channels: Vec<u16>,
@@ -425,7 +446,14 @@ pub mod builder {
             out.push(VM_VERSION);
             out.push(if self.profile_sim { 1 } else { 0 });
             out.extend_from_slice(&self.program_id.to_le_bytes());
-            out.extend_from_slice(&(if self.has_probes { 1u16 } else { 0 }).to_le_bytes());
+            let mut flags = 0u16;
+            if self.has_probes {
+                flags |= FLAG_HAS_PROBES;
+            }
+            if self.reads_dt {
+                flags |= FLAG_READS_DT;
+            }
+            out.extend_from_slice(&flags.to_le_bytes());
             out.extend_from_slice(&(self.constants.len() as u16).to_le_bytes());
             out.push((self.palettes.len() / (PALETTE_STOPS * 3)) as u8);
             out.push(self.channels.len() as u8);
