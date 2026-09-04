@@ -51,11 +51,29 @@ pub const R_T: u8 = 11;
 /// which is most of what the history buffer exists for.
 pub const R_PREV: u8 = 12;
 
+/// Seconds since the previous frame.
+///
+/// What makes a feedback effect rate-independent. A trail written as
+/// `pow(decay, dt * 60)` keeps the same length on a device rendering at 30 fps
+/// as on one rendering at 60, and a mesh of mixed-rate devices shows one effect
+/// rather than two.
+///
+/// It has its own register rather than sharing `t`'s, which is what it used to
+/// do. Aliased to `t` it was the absolute show time, so `pow(decay, dt * 60)`
+/// saturated and every trail became permanent - the strip filled with stuck
+/// white pixels and stayed that way. Nothing failed and nothing was reported;
+/// the effect was simply wrong, in the one construct the language documents as
+/// the right way to write feedback.
+///
+/// Set by [`Machine::run_frame_at`] and never overwritten per pixel, because a
+/// frame has one of these.
+pub const R_DT: u8 = 15;
+
 /// First register not overwritten per pixel.
 ///
 /// Everything from here up survives from `frame` into every pixel, which is what
 /// makes hoisting pay.
-pub const R_SCRATCH: u8 = 15;
+pub const R_SCRATCH: u8 = 16;
 
 /// How deep `REPEAT` blocks and `CALL`s may nest.
 ///
@@ -360,9 +378,11 @@ impl Machine {
         &mut self,
         program: &Program<'_>,
         t: Q16,
+        dt: Q16,
         uniforms: &mut U,
     ) -> Result<(), Fault> {
         self.regs[R_T as usize] = t;
+        self.regs[R_DT as usize] = dt;
         self.run_frame(program, uniforms)
     }
 

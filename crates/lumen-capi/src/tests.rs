@@ -100,7 +100,7 @@ fn null_pointers_return_an_error_rather_than_being_read() {
             LUMEN_NULL
         );
         assert_eq!(
-            lumen_frame(core::ptr::null_mut(), core::ptr::null(), 0, 0),
+            lumen_frame(core::ptr::null_mut(), core::ptr::null(), 0, 0, 0),
             LUMEN_NULL
         );
         assert_eq!(
@@ -161,7 +161,7 @@ fn a_strip_renders_into_the_callers_buffer() {
     let mut out = [0u8; 30];
     unsafe {
         let m = machine(&mut s);
-        assert_eq!(lumen_frame(m, p.as_ptr(), p.len(), 0), LUMEN_OK);
+        assert_eq!(lumen_frame(m, p.as_ptr(), p.len(), 0, 0), LUMEN_OK);
         assert_eq!(
             lumen_render(m, p.as_ptr(), p.len(), 10, out.as_mut_ptr(), out.len()),
             LUMEN_OK
@@ -206,7 +206,7 @@ fn two_halves_render_what_one_whole_does() {
 
     unsafe {
         let a = machine(&mut sa);
-        assert_eq!(lumen_frame(a, p.as_ptr(), p.len(), 12345), LUMEN_OK);
+        assert_eq!(lumen_frame(a, p.as_ptr(), p.len(), 12345, 0), LUMEN_OK);
         assert_eq!(
             lumen_render(a, p.as_ptr(), p.len(), 20, whole.as_mut_ptr(), whole.len()),
             LUMEN_OK
@@ -217,7 +217,7 @@ fn two_halves_render_what_one_whole_does() {
         // needs them.
         let b = machine(&mut sb);
         let c = machine(&mut sc);
-        assert_eq!(lumen_frame(b, p.as_ptr(), p.len(), 12345), LUMEN_OK);
+        assert_eq!(lumen_frame(b, p.as_ptr(), p.len(), 12345, 0), LUMEN_OK);
         assert_eq!(lumen_machine_clone(b as *const LumenMachine, c), LUMEN_OK);
 
         assert_eq!(

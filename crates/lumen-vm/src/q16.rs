@@ -44,6 +44,32 @@ impl Q16 {
         Q16((v as i32) << SHIFT)
     }
 
+    /// Show time in microseconds, as Q16.16 seconds.
+    ///
+    /// The one conversion every device does, so it lives here rather than in
+    /// each of them. It existed twice - once in the C ABI and once in a
+    /// firmware - and the copies disagreed: one computed the sub-second part in
+    /// 64 bits and one in 32, where `999_999 << 16` overflows and the fraction
+    /// becomes noise. On a real strip that looked like an effect updating once a
+    /// second with the pixels jittering in between, on a device correctly
+    /// reporting thirty frames a second.
+    ///
+    /// Seconds wrap at 32 768 rather than saturating. Q16 has no room for a
+    /// clock that has been running for a day, and an effect reads `t` through
+    /// `fract` or a wave, so a wrap is invisible where saturation would freeze
+    /// every animation in the room at once.
+    pub const fn from_micros(micros: u64) -> Q16 {
+        let seconds = (micros / 1_000_000) as i64;
+        let fraction = (micros % 1_000_000) as i64;
+        let whole = (seconds % 32_768) << SHIFT;
+        // In `i64`, deliberately. This is the multiplication that overflows in
+        // 32 bits, and it overflows for every input with a fractional part
+        // above about a sixty-fifth of a second - which is to say nearly all of
+        // them.
+        let part = (fraction << SHIFT) / 1_000_000;
+        Q16((whole | part) as i32)
+    }
+
     /// From a ratio, rounding to nearest. `from_ratio(1, 3)` is a third.
     ///
     /// Returns [`Q16::ZERO`] for a zero denominator; this is a const helper for

@@ -24,7 +24,8 @@ fn render(src: &str, inputs: PixelInputs, t: Q16) -> PixelOutput {
     let (bytes, _) = build(src);
     let program = Program::parse(&bytes).expect("the emitter produced an invalid program");
     let mut m = Machine::new();
-    m.run_frame_at(&program, t, &mut NoUniforms).unwrap();
+    m.run_frame_at(&program, t, Q16::ZERO, &mut NoUniforms)
+        .unwrap();
     m.run_pixel(&program, &inputs, &mut NoUniforms).unwrap()
 }
 
@@ -1436,13 +1437,17 @@ fn distance_works_for_scalars_and_vectors() {
 
 #[test]
 fn normalize_returns_a_unit_vector() {
-    close(
-        eval("length(normalize(vec3(3, 4, 0)).x, normalize(vec3(3, 4, 0)).y)"),
-        1.0,
-        0.02,
-        "normalized length",
-    );
+    // The components, which is stricter than the length: a vector of the right
+    // length pointing the wrong way passes a length check and fails this.
+    close(eval("normalize(vec3(3, 4, 0)).x"), 0.6, 0.02, "x");
+    close(eval("normalize(vec3(3, 4, 0)).y"), 0.8, 0.02, "y");
     close(eval("normalize(vec3(5, 0, 0)).x"), 1.0, 0.02, "unit x");
+
+    // The length is not checked separately. Asserting the components implies it
+    // and is stronger, and the expression that checked it had to call
+    // `normalize` twice to get at both - which, with `dt` now holding a register
+    // of its own, no longer fits in the register file. A test that runs out of
+    // registers says nothing about the thing it was testing.
 }
 
 #[test]
@@ -1845,7 +1850,7 @@ fn run_accessor(src: &str, positions: &[[f64; 3]], x: f64) -> [f64; 3] {
         .collect();
     let mut arrays = Positions(flat);
     let mut m = Machine::new();
-    m.run_frame_at(&program, Q16::ZERO, &mut NoUniforms)
+    m.run_frame_at(&program, Q16::ZERO, Q16::ZERO, &mut NoUniforms)
         .expect("frame");
 
     let u = Q16::from_ratio((x * 1000.0) as i32, 1000);

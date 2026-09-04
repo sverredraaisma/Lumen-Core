@@ -168,6 +168,12 @@ pub unsafe extern "C" fn lumen_program_check(
 /// throughout, so a firmware holding microseconds converts once here rather than
 /// letting a float in through the back door.
 ///
+/// `dt_q16` is the time since the previous frame, and it is not optional. An
+/// effect writes a trail as `pow(decay, dt * 60)` so that it looks the same on a
+/// 30 fps device as on a 60 fps one; pass zero and every trail becomes
+/// permanent, which on a real strip looks like pixels sticking on and staying
+/// there. Pass what your frame timer actually measured, not what it aimed for.
+///
 /// Must be called before the pixels of that frame. The whole performance story
 /// of this VM is that hoisted work happens once here instead of once per LED.
 ///
@@ -181,6 +187,7 @@ pub unsafe extern "C" fn lumen_frame(
     bytes: *const u8,
     len: usize,
     t_q16: i32,
+    dt_q16: i32,
 ) -> i32 {
     let Some(m) = (machine as *mut Machine).as_mut() else {
         return LUMEN_NULL;
@@ -191,7 +198,7 @@ pub unsafe extern "C" fn lumen_frame(
     let Ok(program) = Program::parse(slice) else {
         return LUMEN_BAD_PROGRAM;
     };
-    match m.run_frame_at(&program, Q16(t_q16), &mut NoUniforms) {
+    match m.run_frame_at(&program, Q16(t_q16), Q16(dt_q16), &mut NoUniforms) {
         Ok(()) => LUMEN_OK,
         Err(_) => LUMEN_FAULTED,
     }
@@ -388,15 +395,10 @@ pub unsafe extern "C" fn lumen_header_read(
 /// one step.
 #[no_mangle]
 pub extern "C" fn lumen_time_q16(micros: u64) -> i32 {
-    let seconds = (micros / 1_000_000) as i64;
-    let fraction = (micros % 1_000_000) as i64;
-    // Wrapped rather than saturated: a show clock runs for as long as the
-    // installation is powered, and an effect reads `t` through `fract` or a
-    // wave, so wrapping is invisible where saturating would freeze every
-    // animation in the room.
-    let whole = (seconds % 32_768) << 16;
-    let part = (fraction << 16) / 1_000_000;
-    (whole | part) as i32
+    // One implementation, in the VM, shared with every device that renders in
+    // Rust. It used to be written out here as well, and the two copies drifted:
+    // this one was right and the other overflowed its sub-second part.
+    Q16::from_micros(micros).0
 }
 
 // ---- internals -------------------------------------------------------------

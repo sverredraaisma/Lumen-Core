@@ -84,7 +84,8 @@ int32_t lumen_program_check(const uint8_t *bytes, size_t len, uint32_t *budget_o
  *
  * t_q16 is show time in seconds as Q16.16. Use lumen_time_q16 to get there
  * from microseconds. */
-int32_t lumen_frame(LumenMachine *machine, const uint8_t *bytes, size_t len, int32_t t_q16);
+int32_t lumen_frame(LumenMachine *machine, const uint8_t *bytes, size_t len,
+                    int32_t t_q16, int32_t dt_q16);
 
 /* Render the whole strip into rgb_out, which must hold count * 3 bytes.
  *

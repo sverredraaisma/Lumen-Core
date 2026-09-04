@@ -649,7 +649,7 @@ fn frame_results_survive_into_every_pixel() {
     let program = Program::parse(&bytes).unwrap();
 
     let mut m = Machine::new();
-    m.run_frame_at(&program, Q16::from_int(2), &mut NoUniforms)
+    m.run_frame_at(&program, Q16::from_int(2), Q16::ZERO, &mut NoUniforms)
         .unwrap();
     for i in 0..10 {
         let inputs = PixelInputs {
@@ -728,7 +728,7 @@ fn show_time_reaches_the_frame_section() {
     let bytes = b.build();
     let program = Program::parse(&bytes).unwrap();
     let mut m = Machine::new();
-    m.run_frame_at(&program, Q16::from_int(42), &mut NoUniforms)
+    m.run_frame_at(&program, Q16::from_int(42), Q16::ZERO, &mut NoUniforms)
         .unwrap();
     assert_eq!(m.register(R_SCRATCH), Some(Q16::from_int(42)));
 }
@@ -1049,7 +1049,8 @@ fn a_plane_sweeping_through_a_room_is_a_pure_function_of_position_and_time() {
 
     let render = |zs: &[i32], t: Q16| {
         let mut m = Machine::new();
-        m.run_frame_at(&program, t, &mut NoUniforms).unwrap();
+        m.run_frame_at(&program, t, Q16::ZERO, &mut NoUniforms)
+            .unwrap();
         zs.iter()
             .map(|&z| {
                 let inputs = PixelInputs {

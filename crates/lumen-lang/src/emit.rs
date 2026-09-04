@@ -25,7 +25,7 @@ use lumen_vm::program::builder::ProgramBuilder;
 use lumen_vm::program::{Section, PALETTE_STOPS};
 use lumen_vm::q16::Q16;
 use lumen_vm::vm::{
-    R_I, R_LX, R_LY, R_LZ, R_N, R_PREV, R_SCRATCH, R_T, R_U, R_UV_X, R_X, R_Y, R_Z,
+    R_DT, R_I, R_LX, R_LY, R_LZ, R_N, R_PREV, R_SCRATCH, R_T, R_U, R_UV_X, R_X, R_Y, R_Z,
 };
 
 use crate::ast::*;
@@ -1300,7 +1300,11 @@ impl Emitter<'_, '_> {
                 "i" => Val::scalar(R_I),
                 "n" => Val::scalar(R_N),
                 "u" => Val::scalar(R_U),
-                "t" | "dt" => Val::scalar(R_T),
+                "t" => Val::scalar(R_T),
+                // Its own register. Sharing `t`'s made `dt` the absolute show
+                // time, which silently broke every rate-independent effect -
+                // see the note on `R_DT`.
+                "dt" => Val::scalar(R_DT),
                 "pos" => Val {
                     base: R_X,
                     width: 3,
