@@ -175,6 +175,17 @@ fn emit_sim_program(e: &mut Emitter<'_, '_>, resolved: &Resolved<'_>) -> Option<
     // emitter counted only assigned fields, so a body reading `p.vel` without
     // writing it resolved and then silently failed to emit.
     if !e.emit_sim(sim, declared.count, &declared.fields) {
+        // Every refusal above says why. Reaching here with nothing said would
+        // drop the simulation and report success, which is the one outcome the
+        // project's rules single out as worse than refusing.
+        if !e.diags.has_errors() {
+            e.diags.push(Diagnostic::error(
+                sim.span,
+                "the simulation could not be compiled",
+                "this is a compiler bug: it failed without saying why. Please report the effect that caused it",
+            ));
+        }
+        e.failed = true;
         return None;
     }
 
@@ -346,12 +357,17 @@ impl Emitter<'_, '_> {
     /// Returns `false` if anything in the body has no lowering, having already
     /// said which.
     fn emit_sim(&mut self, sim: &crate::ast::Sim, count: u32, fields: &[String]) -> bool {
-        // A fresh register file: the sim program is a separate artefact and
-        // shares nothing with the pixel program's allocation.
+        // A fresh register file, and a *larger* one. The sim program is a
+        // separate artefact that never reads a pixel input, so the block those
+        // occupy - everything below `R_SCRATCH` except the show time - is free
+        // here. Starting where the pixel program starts wasted three registers
+        // for nothing, which was enough to run a two-armed `if` over a
+        // two-field element out of them.
         let saved = (self.next_permanent, self.temp_floor, self.next_temp);
-        self.next_permanent = R_SCRATCH;
-        self.temp_floor = R_SCRATCH;
-        self.next_temp = R_SCRATCH;
+        let floor = lumen_vm::vm::R_T + 1;
+        self.next_permanent = floor;
+        self.temp_floor = floor;
+        self.next_temp = floor;
         self.in_sim = true;
 
         let ok = self.sim_stmts(&sim.body, sim, count, fields);
@@ -388,7 +404,38 @@ impl Emitter<'_, '_> {
                     }
                     self.bound.push((b.name.clone(), dst));
                 }
-                SimStmt::Assign(a) if a.field.is_none() => {
+                SimStmt::Assign(a) if a.field.is_some() => {
+                    // Assigning an element's field, which is only meaningful
+                    // inside a `foreach` - and may be nested arbitrarily deep in
+                    // branches within one. Handled here rather than in a
+                    // separate walk for the arms, because a second walk is how
+                    // an `if` inside a `foreach` came to refuse the very
+                    // assignments the loop exists to make.
+                    let field = a.field.as_deref().unwrap_or("");
+                    let name = alloc::format!("{}.{field}", a.target);
+                    let Some(dst) = self.bound.iter().find(|(n, _)| n == &name).map(|(_, v)| *v)
+                    else {
+                        self.diags.push(Diagnostic::error(
+                            a.span,
+                            alloc::format!("`{}` is not an element in scope here", a.target),
+                            "assign a field through the binding a `foreach` introduces, as in `foreach p in name { p.vel = ... }`",
+                        ));
+                        return false;
+                    };
+                    let Some(v) = self.expr(Rate::Frame, &a.value) else {
+                        return false;
+                    };
+                    // A scalar assigned to a three-lane field fills all three,
+                    // which is what `p.vel = 0` has to mean.
+                    for lane in 0..3u8 {
+                        let src = if v.width == 1 { v.base } else { v.base + lane };
+                        self.push(
+                            Rate::Frame,
+                            Instruction::new(OpCode::Mov, dst.base + lane, src, 0),
+                        );
+                    }
+                }
+                SimStmt::Assign(a) => {
                     let Some(v) = self.expr(Rate::Frame, &a.value) else {
                         return false;
                     };
@@ -407,21 +454,15 @@ impl Emitter<'_, '_> {
                         );
                     }
                 }
-                // A field assignment outside a `foreach` has no element to write
-                // to; `resolve` has already said so.
-                SimStmt::Assign(_) => return false,
-                SimStmt::If { span, .. } => {
-                    // `MASK_TEST` can express this - it skips forward when a
-                    // register is zero - but a forward skip needs its distance
-                    // patched once the branch is emitted, and doing that
-                    // carelessly is how a compiler starts producing plausible
-                    // wrong code. A separate change, with its own tests.
-                    self.diags.push(Diagnostic::error(
-                        *span,
-                        "`if` inside a `sim` cannot be compiled yet",
-                        "write the branch arithmetically with `select` or `step`, which is what the pixel profile does",
-                    ));
-                    return false;
+                SimStmt::If {
+                    cond,
+                    then,
+                    otherwise,
+                    ..
+                } => {
+                    if !self.sim_if(cond, then, otherwise, sim, count, fields) {
+                        return false;
+                    }
                 }
                 SimStmt::ForEach { binding, body, .. } => {
                     // Unrolled over the count, for the same reason the accessors
@@ -435,6 +476,116 @@ impl Emitter<'_, '_> {
                 }
             }
         }
+        true
+    }
+
+    /// Lower `if cond { .. } else { .. }` with `MASK_TEST`.
+    ///
+    /// `MASK_TEST a, n` skips `n` instructions when register `a` is zero, and
+    /// the program counter has already moved past it by then — so a skip of `n`
+    /// lands `n` instructions further on. There is no unconditional jump in the
+    /// ISA, and none is needed: a register known to hold zero makes `MASK_TEST`
+    /// into one.
+    ///
+    /// ```text
+    ///   LOAD_K   zero, 0
+    ///   <cond>
+    ///   MASK_TEST cond, len(then) + 1   ; false: skip the arm and the jump
+    ///   <then>
+    ///   MASK_TEST zero, len(else)       ; true: having run `then`, skip `else`
+    ///   <else>
+    /// ```
+    ///
+    /// The distances are patched after each arm is emitted rather than computed
+    /// in advance, because an arm's length is not known until it exists —
+    /// nested branches and unrolled loops both change it. Patching from the
+    /// instruction vector's own length is the only form of this that cannot
+    /// drift from what was actually emitted.
+    fn sim_if(
+        &mut self,
+        cond: &Expr,
+        then: &[SimStmt],
+        otherwise: &[SimStmt],
+        sim: &crate::ast::Sim,
+        count: u32,
+        fields: &[String],
+    ) -> bool {
+        let mark = self.next_temp;
+
+        // Hoisted out of both arms: it must hold zero whichever way the branch
+        // goes, and emitting it inside `then` would leave it unset on the path
+        // that skips `then`.
+        let Some(zero) = self.temp(1) else {
+            return false;
+        };
+        let k = self.constant(0.0);
+        self.push(
+            Rate::Frame,
+            Instruction::with_imm(OpCode::LoadK, zero.base, k),
+        );
+
+        let Some(c) = self.expr(Rate::Frame, cond) else {
+            return false;
+        };
+
+        let test_at = self.sim_body.len();
+        self.push(
+            Rate::Frame,
+            Instruction::with_imm(OpCode::MaskTest, c.base, 0),
+        );
+
+        if !self.sim_stmts(then, sim, count, fields) {
+            return false;
+        }
+
+        if otherwise.is_empty() {
+            let skip = self.sim_body.len() - test_at - 1;
+            if !self.patch_skip(test_at, skip) {
+                return false;
+            }
+        } else {
+            let jump_at = self.sim_body.len();
+            self.push(
+                Rate::Frame,
+                Instruction::with_imm(OpCode::MaskTest, zero.base, 0),
+            );
+
+            // The false path skips the whole `then` arm *and* the jump that
+            // ends it, landing on the first instruction of `else`.
+            let skip_then = jump_at + 1 - test_at - 1;
+            if !self.patch_skip(test_at, skip_then) {
+                return false;
+            }
+
+            if !self.sim_stmts(otherwise, sim, count, fields) {
+                return false;
+            }
+            let skip_else = self.sim_body.len() - jump_at - 1;
+            if !self.patch_skip(jump_at, skip_else) {
+                return false;
+            }
+        }
+
+        self.release_to(mark);
+        true
+    }
+
+    /// Write a skip distance into a `MASK_TEST` already emitted.
+    fn patch_skip(&mut self, at: usize, skip: usize) -> bool {
+        let Ok(skip) = u16::try_from(skip) else {
+            // A branch longer than 65 535 instructions. Not reachable from
+            // anything the language can express today, and a silent truncation
+            // here would jump into the middle of an arm.
+            self.diags.push(Diagnostic::error(
+                self.r.effect.span,
+                "a branch inside a `sim` is too long to compile",
+                "split the simulation into smaller steps",
+            ));
+            self.failed = true;
+            return false;
+        };
+        let a = self.sim_body[at].a;
+        self.sim_body[at] = Instruction::with_imm(OpCode::MaskTest, a, skip);
         true
     }
 
@@ -456,14 +607,18 @@ impl Emitter<'_, '_> {
         // rather than only those read is what keeps the write-back below
         // simple, and a field nobody touches costs three loads once per element
         // rather than anything per pixel.
+        // One index register for every load and store in this element, not one
+        // per field. Registers are the binding constraint on this VM, and an
+        // element with two fields was spending four of them on indices - enough
+        // to run an `if` with two arms out of them entirely.
+        let Some(idx) = self.temp(1) else {
+            return false;
+        };
+
         let mut slots = Vec::new();
         for (array, field) in fields.iter().enumerate() {
             let Some(v) = self.temp(3) else {
                 return false;
-            };
-            let idx = match self.temp(1) {
-                Some(i) => i,
-                None => return false,
             };
             for lane in 0..3u8 {
                 let c = self.constant((k * 3 + lane as u32) as f64);
@@ -480,17 +635,14 @@ impl Emitter<'_, '_> {
             slots.push((array as u8, v));
         }
 
-        let ok = self.sim_stmts_in_element(body, sim, count, fields, binding);
+        let _ = binding;
+        let ok = self.sim_stmts(body, sim, count, fields);
 
         if ok {
             // Write back, in the same order, so a field read by a later element
             // sees this one's update - which is what makes the unrolled loop
             // mean the same thing as a real one.
             for (array, v) in &slots {
-                let idx = match self.temp(1) {
-                    Some(i) => i,
-                    None => return false,
-                };
                 for lane in 0..3u8 {
                     let c = self.constant((k * 3 + lane as u32) as f64);
                     self.push(
@@ -513,48 +665,6 @@ impl Emitter<'_, '_> {
         self.bound.truncate(bound_before);
         self.release_to(mark);
         ok
-    }
-
-    /// The body of a `foreach`, where `p.field` names a bound register.
-    fn sim_stmts_in_element(
-        &mut self,
-        body: &[SimStmt],
-        sim: &crate::ast::Sim,
-        count: u32,
-        fields: &[String],
-        binding: &str,
-    ) -> bool {
-        for stmt in body {
-            if let SimStmt::Assign(a) = stmt {
-                if let Some(field) = &a.field {
-                    if a.target != binding {
-                        return false;
-                    }
-                    let Some(v) = self.expr(Rate::Frame, &a.value) else {
-                        return false;
-                    };
-                    let name = alloc::format!("{binding}.{field}");
-                    let Some(dst) = self.bound.iter().find(|(n, _)| n == &name).map(|(_, v)| *v)
-                    else {
-                        return false;
-                    };
-                    // A scalar assigned to a three-lane field fills all three,
-                    // which is what `p.vel = 0` has to mean.
-                    for lane in 0..3u8 {
-                        let src = if v.width == 1 { v.base } else { v.base + lane };
-                        self.push(
-                            Rate::Frame,
-                            Instruction::new(OpCode::Mov, dst.base + lane, src, 0),
-                        );
-                    }
-                    continue;
-                }
-            }
-            if !self.sim_stmts(core::slice::from_ref(stmt), sim, count, fields) {
-                return false;
-            }
-        }
-        true
     }
 
     // ---- sim accessors ----------------------------------------------------

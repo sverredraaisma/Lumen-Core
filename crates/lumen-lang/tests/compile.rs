@@ -559,29 +559,25 @@ fn unimplemented_constructs_are_refused_loudly_rather_than_ignored() {
     // Compiling something that silently does less than the author wrote is the
     // one outcome worse than refusing.
     //
-    // `if` inside a `sim` is what is still missing. `MASK_TEST` can express it,
-    // but a forward skip needs its distance patched once the branch is emitted,
-    // and doing that carelessly is how a compiler starts producing plausible
-    // wrong code.
+    // Everything the grammar accepts now compiles, so what this guards is the
+    // *rule* rather than any particular gap: a second `sim` with a body is
+    // refused, because a device runs one simulation program and quietly picking
+    // one of two would be exactly the silent under-delivery the rule forbids.
     let es = errors(
         r#"
 lumen 1
 effect "x" {
-  sim particles(count = 8) {
-    foreach p in particles {
-      if p.pos > 1 {
-        p.pos = 0
-      }
-    }
+  sim a(count = 4) {
+    foreach p in a { p.pos = p.pos }
   }
-  layer b { color = rgb(0,0,0) }
+  sim b(count = 4) {
+    foreach p in b { p.pos = p.pos }
+  }
+  layer l { color = rgb(0,0,0) }
 }
 "#,
     );
-    assert!(
-        es.iter().any(|e| e.contains("cannot be compiled yet")),
-        "{es:?}"
-    );
+    assert!(es.iter().any(|e| e.contains("only one `sim`")), "{es:?}");
 }
 
 #[test]
@@ -2089,4 +2085,155 @@ effect "particles" {
     assert!((x(state.pos[3]) - 0.7).abs() < 0.01, "{}", x(state.pos[3]));
     // Velocity is untouched by this body.
     assert!((x(state.vel[0]) - 0.1).abs() < 0.01);
+}
+
+#[test]
+fn a_branch_in_a_sim_takes_the_arm_the_condition_chooses() {
+    // `if` exists only inside `sim`, because the pixel profile has no
+    // data-dependent control flow. It lowers to `MASK_TEST`, which skips forward
+    // when a register is zero - and a forward skip whose distance is one out
+    // lands in the middle of an arm and produces plausible wrong code rather
+    // than a crash. So this checks the values, not the shape.
+    use lumen_vm::q16::Q16;
+    use lumen_vm::vm::{Machine, NoUniforms};
+
+    let src = r#"
+lumen 1
+effect "branching" {
+  sim swarm(count = 2) {
+    foreach p in swarm {
+      if p.pos > 1 {
+        p.pos = p.pos - 1
+      } else {
+        p.pos = p.pos + p.vel
+      }
+    }
+  }
+  layer base { color = rgb(1, 0, 0) }
+}
+"#;
+    let (compiled, diags) = compile(src);
+    assert!(!diags.has_errors(), "{}", diags.render(src));
+    let program_bytes = compiled.expect("compiles").sim.expect("a sim program");
+    let program = lumen_vm::program::Program::parse(&program_bytes).expect("parses");
+
+    struct State {
+        pos: Vec<Q16>,
+        vel: Vec<Q16>,
+    }
+    impl lumen_vm::vm::Arrays for State {
+        fn len(&self, a: u8) -> Option<usize> {
+            match a {
+                0 => Some(self.pos.len()),
+                1 => Some(self.vel.len()),
+                _ => None,
+            }
+        }
+        fn load(&self, a: u8, i: usize) -> Result<Q16, lumen_vm::Fault> {
+            let v = match a {
+                0 => &self.pos,
+                1 => &self.vel,
+                _ => return Err(lumen_vm::Fault::OutOfBounds),
+            };
+            v.get(i).copied().ok_or(lumen_vm::Fault::OutOfBounds)
+        }
+        fn store(&mut self, a: u8, i: usize, val: Q16) -> Result<(), lumen_vm::Fault> {
+            let v = match a {
+                0 => &mut self.pos,
+                1 => &mut self.vel,
+                _ => return Err(lumen_vm::Fault::OutOfBounds),
+            };
+            *v.get_mut(i).ok_or(lumen_vm::Fault::OutOfBounds)? = val;
+            Ok(())
+        }
+    }
+
+    let q = |v: f64| Q16::from_ratio((v * 1000.0) as i32, 1000);
+    // Element 0 is past 1 and should wrap; element 1 is not and should advance.
+    let mut state = State {
+        pos: vec![q(1.5), q(0.0), q(0.0), q(0.25), q(0.0), q(0.0)],
+        vel: vec![q(0.1), q(0.0), q(0.0), q(0.1), q(0.0), q(0.0)],
+    };
+
+    let mut m = Machine::new();
+    m.run_sim(&program, Q16::ZERO, &mut NoUniforms, &mut state)
+        .expect("the sim runs");
+
+    let x = |v: Q16| v.0 as f64 / 65536.0;
+    assert!(
+        (x(state.pos[0]) - 0.5).abs() < 0.01,
+        "the true arm did not run: {}",
+        x(state.pos[0])
+    );
+    assert!(
+        (x(state.pos[3]) - 0.35).abs() < 0.01,
+        "the false arm did not run: {}",
+        x(state.pos[3])
+    );
+}
+
+#[test]
+fn a_branch_with_no_else_falls_through() {
+    // The skip distance differs by one between the two shapes - with an `else`
+    // the false path must also skip the jump that ends the true arm - so the
+    // two are worth checking separately.
+    use lumen_vm::q16::Q16;
+    use lumen_vm::vm::{Machine, NoUniforms};
+
+    let src = r#"
+lumen 1
+effect "clamping" {
+  sim swarm(count = 2) {
+    foreach p in swarm {
+      if p.pos > 1 {
+        p.pos = 0
+      }
+    }
+  }
+  layer base { color = rgb(1, 0, 0) }
+}
+"#;
+    let (compiled, diags) = compile(src);
+    assert!(!diags.has_errors(), "{}", diags.render(src));
+    let bytes = compiled.expect("compiles").sim.expect("a sim program");
+    let program = lumen_vm::program::Program::parse(&bytes).expect("parses");
+
+    struct P(Vec<Q16>);
+    impl lumen_vm::vm::Arrays for P {
+        fn len(&self, a: u8) -> Option<usize> {
+            (a == 0).then_some(self.0.len())
+        }
+        fn load(&self, a: u8, i: usize) -> Result<Q16, lumen_vm::Fault> {
+            if a != 0 {
+                return Err(lumen_vm::Fault::OutOfBounds);
+            }
+            self.0.get(i).copied().ok_or(lumen_vm::Fault::OutOfBounds)
+        }
+        fn store(&mut self, a: u8, i: usize, v: Q16) -> Result<(), lumen_vm::Fault> {
+            if a != 0 {
+                return Err(lumen_vm::Fault::OutOfBounds);
+            }
+            *self.0.get_mut(i).ok_or(lumen_vm::Fault::OutOfBounds)? = v;
+            Ok(())
+        }
+    }
+
+    let q = |v: f64| Q16::from_ratio((v * 1000.0) as i32, 1000);
+    let mut state = P(vec![q(2.0), q(0.0), q(0.0), q(0.5), q(0.0), q(0.0)]);
+    let mut m = Machine::new();
+    m.run_sim(&program, Q16::ZERO, &mut NoUniforms, &mut state)
+        .expect("runs");
+
+    let x = |v: Q16| v.0 as f64 / 65536.0;
+    assert!(
+        x(state.0[0]).abs() < 0.01,
+        "over the limit: {}",
+        x(state.0[0])
+    );
+    // Untouched, which is the whole point of there being no else.
+    assert!(
+        (x(state.0[3]) - 0.5).abs() < 0.01,
+        "under: {}",
+        x(state.0[3])
+    );
 }

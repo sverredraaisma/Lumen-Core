@@ -316,10 +316,25 @@ reason accessors do. Element fields live one array per field, `pos` in array 0
 because the accessors are compiled separately and measure against it, and the
 rest sorted so two compilations agree.
 
-`if` inside a `sim` is the piece still to build. `MASK_TEST` can express it — it
-skips forward when a register is zero — but a forward skip needs its distance
-patched once the branch is emitted, and doing that carelessly is how a compiler
-starts producing plausible wrong code.
+`if` lowers to `MASK_TEST`, which skips forward when a register is zero. There is
+no unconditional jump in the ISA and none is needed: a register known to hold
+zero makes `MASK_TEST` into one, which is how the `else` arm is skipped after the
+`then` arm has run.
+
+```text
+  LOAD_K    zero, 0
+  <cond>
+  MASK_TEST cond, len(then) + 1   ; false: skip the arm and the jump after it
+  <then>
+  MASK_TEST zero, len(else)       ; true: having run `then`, skip `else`
+  <else>
+```
+
+The distances are patched after each arm is emitted rather than computed ahead,
+because an arm's length is not known until it exists — a nested branch or an
+unrolled loop both change it. A skip one instruction out lands in the middle of
+an arm and produces plausible wrong code rather than a crash, so the tests check
+the values each arm computes and not the shape of what was emitted.
 
 The body is **checked and not yet lowered**. `emit` refuses it, deliberately at
 emission rather than at resolution, so an author still gets every real complaint
