@@ -40,6 +40,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod digest;
 pub mod isa;
 pub mod noise;
 pub mod output;
