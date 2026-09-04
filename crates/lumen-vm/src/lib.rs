@@ -42,6 +42,7 @@
 
 pub mod isa;
 pub mod noise;
+pub mod output;
 pub mod program;
 pub mod q16;
 mod tables;

@@ -82,7 +82,19 @@ static LumenMachine *machine;
 /* The program a controller pushed, and its rendered output. */
 static uint8_t program[2048];
 static size_t  program_len;
+
+/* Linear light, then the codes the strip consumes, then the dither state that
+ * carries between frames. Three buffers because rendering and encoding are
+ * separate jobs; at 60 LEDs that is 720 + 180 + 720 bytes. */
+static int32_t linear[LEDS * LUMEN_BYTES_PER_PIXEL];
 static uint8_t pixels[LEDS * LUMEN_BYTES_PER_PIXEL];
+static int32_t residual[LEDS * LUMEN_BYTES_PER_PIXEL];
+
+static LumenOutput output = {
+    .brightness_q16 = 0,      /* full */
+    .budget_ma      = 500,    /* what a USB port promises without asking */
+    .residual       = residual,
+};
 
 void lumen_panic(void) {
     os_printf("lumen: panic\n");
@@ -121,7 +133,13 @@ void render(uint64_t now_us) {
         return;                      /* hold the last frame rather than flash */
     }
     if (lumen_render(machine, program, program_len,
-                     LEDS, pixels, sizeof pixels) != LUMEN_OK) {
+                     LEDS, linear, sizeof linear) != LUMEN_OK) {
+        return;
+    }
+
+    uint32_t draw_ua = 0;
+    if (lumen_encode(linear, LEDS, pixels, sizeof pixels,
+                     &output, &draw_ua, NULL) != LUMEN_OK) {
         return;
     }
     strip_write(pixels, sizeof pixels);   /* your LED driver */
@@ -171,7 +189,13 @@ taken its share:
 |---|---|
 | machine storage | `lumen_machine_size()`, a few hundred |
 | a compiled program | 1–3 KB, whatever the controller pushed |
+| 60 LEDs of linear light | 720 |
+| 60 LEDs of dither state | 720 |
 | 60 LEDs of output | 180 |
+
+The dither state is optional — pass `NULL` and the library rounds instead — but
+it is the cheapest 720 bytes here. Without it nothing below 1/255 reaches the
+strip, so every fade ends in a few visible steps well before it reaches black.
 
 That fits with room to spare. A strip long enough to worry about is one long
 enough to be worth a bigger chip.

@@ -158,7 +158,7 @@ fn a_program_reports_the_budget_it_carries() {
 fn a_strip_renders_into_the_callers_buffer() {
     let p = ramp();
     let mut s = storage();
-    let mut out = [0u8; 30];
+    let mut out = [0i32; 30];
     unsafe {
         let m = machine(&mut s);
         assert_eq!(lumen_frame(m, p.as_ptr(), p.len(), 0, 0), LUMEN_OK);
@@ -181,7 +181,7 @@ fn a_buffer_too_small_for_the_strip_is_refused() {
     // device with no memory protection to notice.
     let p = ramp();
     let mut s = storage();
-    let mut out = [0u8; 8];
+    let mut out = [0i32; 8];
     unsafe {
         let m = machine(&mut s);
         assert_eq!(
@@ -200,9 +200,9 @@ fn two_halves_render_what_one_whole_does() {
     // device and the mesh stops agreeing with itself.
     let p = ramp();
     let (mut sa, mut sb, mut sc) = (storage(), storage(), storage());
-    let mut whole = [0u8; 60];
-    let mut first = [0u8; 30];
-    let mut second = [0u8; 30];
+    let mut whole = [0i32; 60];
+    let mut first = [0i32; 30];
+    let mut second = [0i32; 30];
 
     unsafe {
         let a = machine(&mut sa);
@@ -256,7 +256,7 @@ fn two_halves_render_what_one_whole_does() {
 fn a_range_outside_the_strip_is_refused() {
     let p = ramp();
     let mut s = storage();
-    let mut out = [0u8; 60];
+    let mut out = [0i32; 60];
     unsafe {
         let m = machine(&mut s);
         // Backwards, and past the end: both are a caller that has miscomputed a
@@ -322,6 +322,163 @@ fn a_short_datagram_is_not_a_header() {
                 core::ptr::null_mut()
             ),
             LUMEN_BAD_DATAGRAM
+        );
+    }
+}
+
+#[test]
+fn encoding_turns_linear_light_into_codes() {
+    // Full scale must land exactly on 255. A white that comes out at 254 is a
+    // strip that never reaches white.
+    let linear = [Q16::ONE.0, Q16::HALF.0, 0];
+    let mut out = [0u8; 3];
+    unsafe {
+        assert_eq!(
+            lumen_encode(
+                linear.as_ptr(),
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+                core::ptr::null(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            ),
+            LUMEN_OK
+        );
+    }
+    assert_eq!(out, [255, 128, 0]);
+}
+
+#[test]
+fn a_null_config_is_the_working_default() {
+    // A firmware that does not care should not have to build a struct, and a
+    // firmware that memsets one to zero should get the same answer.
+    let linear = [Q16::HALF.0; 3];
+    let (mut a, mut b) = ([0u8; 3], [0u8; 3]);
+    let zeroed = LumenOutput {
+        brightness_q16: 0,
+        budget_ma: 0,
+        residual: core::ptr::null_mut(),
+    };
+    unsafe {
+        lumen_encode(
+            linear.as_ptr(),
+            1,
+            a.as_mut_ptr(),
+            a.len(),
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        lumen_encode(
+            linear.as_ptr(),
+            1,
+            b.as_mut_ptr(),
+            b.len(),
+            &zeroed,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+    }
+    assert_eq!(a, b);
+}
+
+#[test]
+fn dithering_through_the_abi_reaches_a_value_below_one_code() {
+    // The reason the residual pointer exists. Half a code is either 0 or 1 for
+    // ever without it, which is the bottom of every fade going missing.
+    let half_code = Q16(Q16::ONE.0 / 510).0;
+    let linear = [half_code; 3];
+    let mut residual = [0i32; 3];
+    let mut out = [0u8; 3];
+    let cfg = LumenOutput {
+        brightness_q16: 0,
+        budget_ma: 0,
+        residual: residual.as_mut_ptr(),
+    };
+    let mut lit = 0;
+    for _ in 0..10 {
+        unsafe {
+            lumen_encode(
+                linear.as_ptr(),
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+                &cfg,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+        }
+        if out[0] > 0 {
+            lit += 1;
+        }
+    }
+    assert!((4..=6).contains(&lit), "lit on {lit} frames of ten");
+}
+
+#[test]
+fn a_frame_over_its_supply_is_derated_and_says_so() {
+    // Sixty LEDs of full white against a 500 mA supply. The report matters as
+    // much as the derating: a strip quietly at 40% looks exactly like an effect
+    // that is quietly wrong.
+    let linear = [Q16::ONE.0; 180];
+    let mut out = [0u8; 180];
+    let cfg = LumenOutput {
+        brightness_q16: 0,
+        budget_ma: 500,
+        residual: core::ptr::null_mut(),
+    };
+    let (mut draw, mut derated) = (0u32, 0i32);
+    unsafe {
+        assert_eq!(
+            lumen_encode(
+                linear.as_ptr(),
+                60,
+                out.as_mut_ptr(),
+                out.len(),
+                &cfg,
+                &mut draw,
+                &mut derated,
+            ),
+            LUMEN_OK
+        );
+    }
+    assert!(draw <= 500_000, "drew {draw}");
+    assert!(derated < Q16::ONE.0, "not derated");
+    // Uniform, so white is still white rather than losing its highlights.
+    assert!(out.iter().all(|b| *b == out[0]));
+    assert!(out[0] > 0 && out[0] < 255);
+}
+
+#[test]
+fn encoding_checks_its_pointers_and_its_buffer() {
+    let linear = [0i32; 3];
+    let mut out = [0u8; 3];
+    unsafe {
+        assert_eq!(
+            lumen_encode(
+                core::ptr::null(),
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+                core::ptr::null(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut()
+            ),
+            LUMEN_NULL
+        );
+        // Two LEDs asked for, one LED of room.
+        assert_eq!(
+            lumen_encode(
+                linear.as_ptr(),
+                2,
+                out.as_mut_ptr(),
+                out.len(),
+                core::ptr::null(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut()
+            ),
+            LUMEN_TOO_SMALL
         );
     }
 }

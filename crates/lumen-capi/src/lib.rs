@@ -34,6 +34,7 @@
 use core::ffi::c_void;
 
 use lumen_proto::header::Header;
+use lumen_vm::output::{Output, PowerModel};
 use lumen_vm::program::Program;
 use lumen_vm::q16::Q16;
 use lumen_vm::vm::{Machine, NoUniforms, PixelInputs, PixelOutput};
@@ -226,40 +227,10 @@ pub unsafe extern "C" fn lumen_render(
     bytes: *const u8,
     len: usize,
     count: u16,
-    rgb_out: *mut u8,
+    linear_out: *mut i32,
     out_len: usize,
 ) -> i32 {
-    let Some(m) = (machine as *mut Machine).as_mut() else {
-        return LUMEN_NULL;
-    };
-    let Some(slice) = as_slice(bytes, len) else {
-        return LUMEN_NULL;
-    };
-    if rgb_out.is_null() {
-        return LUMEN_NULL;
-    }
-    let needed = count as usize * BYTES_PER_PIXEL;
-    if out_len < needed {
-        return LUMEN_TOO_SMALL;
-    }
-    let Ok(program) = Program::parse(slice) else {
-        return LUMEN_BAD_PROGRAM;
-    };
-    let out = core::slice::from_raw_parts_mut(rgb_out, needed);
-
-    for i in 0..count {
-        let inputs = inputs_for(i, count);
-        let pixel = match m.run_pixel(&program, &inputs, &mut NoUniforms) {
-            Ok(p) => p,
-            Err(_) => return LUMEN_FAULTED,
-        };
-        let (r, g, b) = channels(pixel);
-        let at = i as usize * BYTES_PER_PIXEL;
-        out[at] = to_u8(r);
-        out[at + 1] = to_u8(g);
-        out[at + 2] = to_u8(b);
-    }
-    LUMEN_OK
+    lumen_render_range(machine, bytes, len, 0, count, count, linear_out, out_len)
 }
 
 /// Render part of a strip, for a firmware splitting the work.
@@ -285,7 +256,7 @@ pub unsafe extern "C" fn lumen_render_range(
     from: u16,
     to: u16,
     count: u16,
-    rgb_out: *mut u8,
+    linear_out: *mut i32,
     out_len: usize,
 ) -> i32 {
     let Some(m) = (machine as *mut Machine).as_mut() else {
@@ -294,7 +265,7 @@ pub unsafe extern "C" fn lumen_render_range(
     let Some(slice) = as_slice(bytes, len) else {
         return LUMEN_NULL;
     };
-    if rgb_out.is_null() {
+    if linear_out.is_null() {
         return LUMEN_NULL;
     }
     if from > to || to > count {
@@ -307,7 +278,7 @@ pub unsafe extern "C" fn lumen_render_range(
     let Ok(program) = Program::parse(slice) else {
         return LUMEN_BAD_PROGRAM;
     };
-    let out = core::slice::from_raw_parts_mut(rgb_out, needed);
+    let out = core::slice::from_raw_parts_mut(linear_out, needed);
 
     for i in from..to {
         let inputs = inputs_for(i, count);
@@ -317,9 +288,69 @@ pub unsafe extern "C" fn lumen_render_range(
         };
         let (r, g, b) = channels(pixel);
         let at = (i - from) as usize * BYTES_PER_PIXEL;
-        out[at] = to_u8(r);
-        out[at + 1] = to_u8(g);
-        out[at + 2] = to_u8(b);
+        out[at] = r.0;
+        out[at + 1] = g.0;
+        out[at + 2] = b.0;
+    }
+    LUMEN_OK
+}
+
+/// Turn a rendered frame into the codes a strip consumes.
+///
+/// `linear` is what [`lumen_render`] wrote: three Q16.16 values per LED, in
+/// linear light. `rgb_out` takes three bytes per LED.
+///
+/// Separate from rendering because the two are separate jobs, and because
+/// deciding a frame is over its power budget needs the whole frame before any of
+/// it can be scaled. Doing that inside `lumen_render` would mean either
+/// allocating a staging buffer — which nothing in this ABI does — or derating
+/// from the previous frame, which would make a C firmware and a Rust firmware
+/// disagree about the same show.
+///
+/// Returns the predicted draw in microamps through `draw_ua_out`, and the factor
+/// the frame was scaled by through `derated_q16_out`; either may be null. Worth
+/// reading: a strip quietly at 40% because its supply is too small looks exactly
+/// like an effect that is quietly wrong, and the two are found in completely
+/// different places.
+///
+/// # Safety
+///
+/// `linear` must point at `count * 3` readable `int32_t`, `rgb_out` at
+/// `out_len` writable bytes. `output` may be null, meaning defaults.
+#[no_mangle]
+pub unsafe extern "C" fn lumen_encode(
+    linear: *const i32,
+    count: u16,
+    rgb_out: *mut u8,
+    out_len: usize,
+    output: *const LumenOutput,
+    draw_ua_out: *mut u32,
+    derated_q16_out: *mut i32,
+) -> i32 {
+    if linear.is_null() || rgb_out.is_null() {
+        return LUMEN_NULL;
+    }
+    let channels = count as usize * BYTES_PER_PIXEL;
+    if out_len < channels {
+        return LUMEN_TOO_SMALL;
+    }
+
+    // `Q16` is a transparent wrapper over `i32`, so the caller's buffer is
+    // already the right shape and no copy is needed.
+    let linear = core::slice::from_raw_parts(linear as *const Q16, channels);
+    let out = core::slice::from_raw_parts_mut(rgb_out, channels);
+
+    let (stage, residual) = match output.as_ref() {
+        Some(cfg) => cfg.stage(channels),
+        None => (Output::new(), None),
+    };
+    let report = stage.encode(linear, residual, out);
+
+    if let Some(p) = draw_ua_out.as_mut() {
+        *p = report.draw_ua;
+    }
+    if let Some(p) = derated_q16_out.as_mut() {
+        *p = report.derated_to.0;
     }
     LUMEN_OK
 }
@@ -440,13 +471,56 @@ fn channels(pixel: PixelOutput) -> (Q16, Q16, Q16) {
     }
 }
 
-fn to_u8(v: Q16) -> u8 {
-    let raw = v.0;
-    if raw <= 0 {
-        return 0;
+/// How a firmware wants a frame turned into codes.
+///
+/// A zeroed struct is a working default — full brightness, no supply limit, no
+/// dithering — so a firmware that does not care can `memset` one and pass it.
+/// Brightness treats `0` as "unset" for exactly that reason: a device that wants
+/// black should stop rendering rather than render black sixty times a second.
+#[repr(C)]
+pub struct LumenOutput {
+    /// Global brightness as Q16.16. `0` means full.
+    pub brightness_q16: i32,
+    /// What the supply can give, in milliamps. `0` disables derating.
+    ///
+    /// Worth setting. Thirty SK6812 at full white want about 1.2 A, and a board
+    /// that browns out mid-frame looks exactly like a driver that cannot hold
+    /// one.
+    pub budget_ma: u32,
+    /// Dither state: `count * 3` `int32_t`, zeroed at startup and carried
+    /// between frames. Null turns dithering off.
+    ///
+    /// Worth providing. Without it every part of a value smaller than one code
+    /// in 255 is lost, so the dark end of a fade arrives in a few visible steps
+    /// and then stops early — which reads as an effect that is wrong rather than
+    /// a strip that is coarse.
+    pub residual: *mut i32,
+}
+
+impl LumenOutput {
+    /// The lifetime is the caller's, not this struct's: the residual is a
+    /// pointer the firmware owns and keeps between frames, and tying it to
+    /// `&self` would claim the config outlives it, which is backwards.
+    ///
+    /// # Safety
+    ///
+    /// `channels` must be the number of `int32_t` behind `self.residual`, and
+    /// they must live at least as long as `'a`.
+    unsafe fn stage<'a>(&self, channels: usize) -> (Output, Option<&'a mut [i32]>) {
+        let mut output = Output::new();
+        if self.brightness_q16 > 0 {
+            output.brightness = Q16(self.brightness_q16.min(Q16::ONE.0));
+        }
+        if self.budget_ma > 0 {
+            output.power = Some(PowerModel::ws2812(self.budget_ma));
+        }
+        let residual = if self.residual.is_null() {
+            None
+        } else {
+            Some(core::slice::from_raw_parts_mut(self.residual, channels))
+        };
+        (output, residual)
     }
-    let scaled = (raw as i64 * 255) >> 16;
-    scaled.clamp(0, 255) as u8
 }
 
 #[cfg(test)]

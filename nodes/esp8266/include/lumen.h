@@ -87,14 +87,22 @@ int32_t lumen_program_check(const uint8_t *bytes, size_t len, uint32_t *budget_o
 int32_t lumen_frame(LumenMachine *machine, const uint8_t *bytes, size_t len,
                     int32_t t_q16, int32_t dt_q16);
 
-/* Render the whole strip into rgb_out, which must hold count * 3 bytes.
+/* Render the whole strip into linear_out, which must hold count * 3 int32_t.
+ *
+ * The output is **linear light** as Q16.16, not codes: rendering produces light
+ * and lumen_encode turns light into what a strip consumes. They are separate
+ * because deciding a frame is over its power budget needs the whole frame before
+ * any of it can be scaled, and doing that inside here would mean either
+ * allocating a staging buffer - which nothing in this library does - or derating
+ * from the previous frame, which would make this firmware disagree with a Rust
+ * one about the same show.
  *
  * One call for the strip. There is deliberately no per-pixel entry point: it
  * would invite a loop across the language boundary, and the same shape measured
  * on this project's Android binding cost over two hundred times what the
  * batched call did. */
 int32_t lumen_render(LumenMachine *machine, const uint8_t *bytes, size_t len,
-                     uint16_t count, uint8_t *rgb_out, size_t out_len);
+                     uint16_t count, int32_t *linear_out, size_t out_len);
 
 /* Render LEDs [from, to) of a strip of `count`, into (to - from) * 3 bytes.
  *
@@ -112,7 +120,59 @@ int32_t lumen_render(LumenMachine *machine, const uint8_t *bytes, size_t len,
  * mirrored effect rather than an error. */
 int32_t lumen_render_range(LumenMachine *machine, const uint8_t *bytes, size_t len,
                            uint16_t from, uint16_t to, uint16_t count,
-                           uint8_t *rgb_out, size_t out_len);
+                           int32_t *linear_out, size_t out_len);
+
+/* ---- the output stage -------------------------------------------------- */
+
+/* How this device turns a frame into codes.
+ *
+ * A zeroed struct works: full brightness, no supply limit, no dithering. So a
+ * firmware that does not care can memset one and pass it. */
+typedef struct {
+    /* Global brightness as Q16.16. 0 means full, not black - the struct is
+     * designed to be memset to zero and still work, and a device that wants
+     * darkness should stop rendering rather than render black sixty times a
+     * second. */
+    int32_t brightness_q16;
+
+    /* What the supply can give, in milliamps. 0 disables derating.
+     *
+     * Worth setting. Thirty SK6812 at full white want about 1.2 A, and a board
+     * that browns out mid-frame looks exactly like a driver that cannot hold
+     * one. An over-budget frame is dimmed uniformly rather than clipped, so it
+     * keeps its colours. */
+    uint32_t budget_ma;
+
+    /* Dither state: count * 3 int32_t, zeroed at startup and kept between
+     * frames. NULL turns dithering off.
+     *
+     * Worth providing. Eight bits of linear PWM cannot represent anything
+     * below 1/255, so without this the dark end of every fade arrives in a few
+     * visible steps and then stops early - which reads as an effect that is
+     * wrong rather than a strip that is coarse. The dither is deterministic, so
+     * two devices showing one gradient stay in step. */
+    int32_t *residual;
+} LumenOutput;
+
+/* Turn a rendered frame into the bytes a strip consumes.
+ *
+ * `linear` is what lumen_render wrote. `rgb_out` takes three bytes per LED.
+ * `output` may be NULL, meaning defaults.
+ *
+ * draw_ua_out receives the predicted draw in microamps and derated_q16_out the
+ * factor the frame was scaled by; either may be NULL. Worth reading: a strip
+ * quietly at 40% because its supply is too small looks exactly like an effect
+ * that is quietly wrong, and the two are found in completely different places.
+ *
+ * There is no gamma here, deliberately. A WS2812-class LED's PWM is
+ * proportional to the light it emits and a Lumen colour is already linear light,
+ * so an sRGB curve on the way out would make every strip brighter than the
+ * effect asked for. The problem it is usually reached for is quantisation, and
+ * that is what the dithering above is for. */
+int32_t lumen_encode(const int32_t *linear, uint16_t count,
+                     uint8_t *rgb_out, size_t out_len,
+                     const LumenOutput *output,
+                     uint32_t *draw_ua_out, int32_t *derated_q16_out);
 
 /* ---- the wire --------------------------------------------------------- */
 

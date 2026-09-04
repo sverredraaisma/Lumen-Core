@@ -32,7 +32,7 @@ cargo llvm-cov --workspace --summary-only    # coverage; must be >= 95%
 |---|---|
 | `lumen-hal` | traits only, zero implementations |
 | `lumen-proto` | wire framing and codec. Hand-written; round-trips `lumen-spec` vectors |
-| `lumen-vm` | bytecode interpreter, `pixel` and `sim` profiles |
+| `lumen-vm` | bytecode interpreter, `pixel` and `sim` profiles, and the output stage |
 | `lumen-lang` | compiler, plus the public AST, edit API and `fmt` the editor drives |
 | `lumen-crypto` | ChaCha20-Poly1305 and Ed25519 behind the `lumen-proto` seam |
 | `lumen-capi` | C ABI over the codec and VM, for firmware in other languages |
@@ -57,6 +57,13 @@ Dependencies point one way: `hal` ← `proto`/`vm` ← `lang` ← `cli`, with
   dependencies, and only pure-Rust `no_std` ones with no allocator.
 - **No floating point in shipping code.** `Q16` fixed point, so output is
   bit-identical on every chip in the mesh.
+- **There is one output stage, in `lumen-vm::output`, and no gamma in it.** A
+  WS2812-class LED's PWM is proportional to emitted light and a Lumen colour is
+  already linear light, so an sRGB curve on the way out would make every strip
+  brighter than the effect asked for. The problem it gets reached for is
+  quantisation - eight bits of linear PWM cannot hold anything below 1/255 - and
+  that is what the temporal dithering is for. The dither is deterministic
+  because two strips showing one gradient must not shimmer against each other.
 - **Nothing from `lumen-device` moves in here**, however convenient. Election,
   replication, the source stack and the render loop are GPL on purpose — see
   `CONTRIBUTING.md`.
