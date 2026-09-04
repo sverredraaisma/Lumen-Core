@@ -363,7 +363,7 @@ fn a_half_lands_between_two_codes_and_averages_to_the_middle() {
             brightness_q16: 0,
             budget_ma: 0,
             phase,
-            no_dither: 0,
+            dither: 1,
         };
         unsafe {
             lumen_encode(
@@ -388,11 +388,13 @@ fn a_null_config_is_the_working_default() {
     // firmware that memsets one to zero should get the same answer.
     let linear = [Q16::HALF.0; 3];
     let (mut a, mut b) = ([0u8; 3], [0u8; 3]);
+    // Every field zero, which is what a firmware gets from `memset` and must be
+    // a working configuration: full brightness, no supply limit, no dither.
     let zeroed = LumenOutput {
         brightness_q16: 0,
         budget_ma: 0,
         phase: 0,
-        no_dither: 0,
+        dither: 0,
     };
     unsafe {
         lumen_encode(
@@ -430,7 +432,7 @@ fn dithering_through_the_abi_reaches_a_value_below_one_code() {
             brightness_q16: 0,
             budget_ma: 0,
             phase,
-            no_dither: 0,
+            dither: 1,
         };
         unsafe {
             lumen_encode(
@@ -461,7 +463,7 @@ fn a_frame_over_its_supply_is_derated_and_says_so() {
         brightness_q16: 0,
         budget_ma: 500,
         phase: 0,
-        no_dither: 1,
+        dither: 0,
     };
     let (mut draw, mut derated) = (0u32, 0i32);
     unsafe {

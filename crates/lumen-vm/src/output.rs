@@ -25,13 +25,29 @@
 //! The problem an sRGB curve is usually reached for here is real, but it is
 //! **quantisation, not transfer function**: eight bits of linear PWM put half
 //! the eye's usable range into the bottom fifty codes, so a fade ends in visible
-//! steps and then stops early. That is what [`Output::encode`]'s dithering is
-//! for, and dithering fixes it without lying about what a number means.
+//! steps and then stops early.
 //!
-//! # The three channels of a pixel round together
+//! # Dithering is available and off by default
 //!
-//! The first version of this diffused an error per channel, which is the
-//! textbook approach and is wrong here. Red, green and blue at the dark end of a
+//! Trading that quantisation for temporal dithering is the obvious move and it
+//! does not survive contact with a strip. A dithered pixel at the dark end
+//! toggles between two codes every few frames, and a show clock runs at 30 fps —
+//! so a value sitting near half a code flickers at about 15 Hz, which is close to
+//! the worst frequency there is for human vision. On a bare strip a few feet
+//! away it reads as the hardware malfunctioning, which is a good deal worse than
+//! a fade that ends slightly early.
+//!
+//! Temporal dithering wants a frame rate high enough to fuse, and this project's
+//! is set by the mesh's timing grid rather than by what the eye needs. So
+//! [`Output::encode`] rounds by default, and [`Output::with_dither`] turns it on
+//! for a device that runs faster or sits behind a diffuser. The code is kept
+//! because the trade is real in those cases, and the default is what a bare
+//! strip at 30 fps actually wants.
+//!
+//! # When it is on, the three channels of a pixel round together
+//!
+//! The first version diffused an error per channel, which is the textbook
+//! approach and is wrong here. Red, green and blue at the dark end of a
 //! fade sit at slightly different values - `#ecfbff` is (0.79, 0.96, 1.00) in
 //! linear light - so their errors accumulate at different rates and each crosses
 //! a code boundary on a different frame. The strip shows red, then green, then
@@ -101,7 +117,13 @@ pub struct Output {
     pub brightness: Q16,
     /// The supply, if this device knows about one.
     pub power: Option<PowerModel>,
-    /// Whether to dither. On by default; off costs the bottom of every fade.
+    /// Whether to dither.
+    ///
+    /// **Off by default**, and see the note at the top of this module: at the
+    /// 30 fps a show clock runs at, a dithered pixel near half a code flickers
+    /// at around 15 Hz, which looks like a fault rather than a fade. Turn it on
+    /// for a device running fast enough for the toggling to fuse, or one behind
+    /// a diffuser.
     pub dither: bool,
 }
 
@@ -149,7 +171,7 @@ impl Output {
         Output {
             brightness: Q16::ONE,
             power: None,
-            dither: true,
+            dither: false,
         }
     }
 
@@ -298,7 +320,7 @@ mod tests {
         // slightly different values, and diffusing an error per channel made
         // them cross code boundaries on different frames: the dark end of the
         // trail flashed red, then green, then blue instead of fading grey.
-        let o = Output::new();
+        let o = Output::new().with_dither(true);
         let tint = [
             Q16((0.79 * 65536.0) as i32 / 300),
             Q16((0.96 * 65536.0) as i32 / 300),
@@ -323,10 +345,10 @@ mod tests {
 
     #[test]
     fn a_value_below_one_code_is_reached_by_dithering() {
-        // The whole point. Half a code is unrepresentable in eight bits, and
-        // without a dither it is either 0 or 1 for ever - which is why the dark
-        // end of a fade ends in steps and then stops early.
-        let o = Output::new();
+        // What dithering buys, for the devices that can use it. Half a code is
+        // unrepresentable in eight bits and is otherwise 0 for ever, which is
+        // why a fade ends slightly early.
+        let o = Output::new().with_dither(true);
         let half_code = Q16(Q16::ONE.0 / 510);
         let sum: u32 = (0..32)
             .map(|phase| encode(&o, &[half_code; 3], phase).0[0] as u32)
@@ -336,7 +358,7 @@ mod tests {
 
     #[test]
     fn the_average_tracks_the_value_across_the_dark_end() {
-        let o = Output::new();
+        let o = Output::new().with_dither(true);
         for numerator in 1..12u32 {
             let value = Q16((Q16::ONE.0 as i64 * numerator as i64 / 2550) as i32);
             let sum: i64 = (0..64)
@@ -354,7 +376,7 @@ mod tests {
     fn neighbouring_pixels_do_not_all_fire_on_the_same_frame() {
         // A strip whose dark end blinks in unison is far more visible than one
         // where the same light is spread along it.
-        let o = Output::new();
+        let o = Output::new().with_dither(true);
         let dim = Q16(Q16::ONE.0 / 510);
         const LEDS: usize = 10;
         let linear = [dim; LEDS * CHANNELS];
@@ -378,7 +400,7 @@ mod tests {
         // Not a nicety. The threshold comes from show time and the LED index,
         // both of which every device agrees on; a locally-seeded dither would
         // make two strips showing one gradient shimmer against each other.
-        let o = Output::new();
+        let o = Output::new().with_dither(true);
         let value = Q16(1_000);
         for phase in 0..64 {
             assert_eq!(
@@ -390,7 +412,7 @@ mod tests {
 
     #[test]
     fn brightness_scales_the_whole_frame() {
-        let o = Output::new().with_brightness(Q16::HALF).with_dither(false);
+        let o = Output::new().with_brightness(Q16::HALF);
         assert_eq!(encode(&o, &[Q16::ONE; 3], 0).0, [128, 128, 128]);
     }
 
@@ -429,9 +451,7 @@ mod tests {
 
     #[test]
     fn derating_keeps_the_colour_of_a_frame_that_is_not_white() {
-        let o = Output::new()
-            .with_power(PowerModel::ws2812(200))
-            .with_dither(false);
+        let o = Output::new().with_power(PowerModel::ws2812(200));
         let mut linear = [Q16::ZERO; 90];
         for led in 0..30 {
             linear[led * 3] = Q16::ONE;
@@ -486,9 +506,11 @@ mod tests {
     }
 
     #[test]
-    fn without_dither_a_value_below_one_code_is_lost() {
-        // The cost of turning it off, stated rather than implied.
-        let o = Output::new().with_dither(false);
+    fn by_default_a_value_below_one_code_is_lost() {
+        // The cost of the default, stated rather than implied. It is the right
+        // default anyway: at 30 fps the alternative flickers at about 15 Hz,
+        // which reads as a broken strip rather than a short fade.
+        let o = Output::new();
         let half_code = Q16(Q16::ONE.0 / 510);
         let mut out = [0u8; 3];
         o.encode(&[half_code; 3], 0, &mut out);
@@ -499,7 +521,7 @@ mod tests {
     fn rounding_is_to_nearest_rather_than_truncating() {
         // What the render loop used to do was `(v * 255) >> 16`, which always
         // rounds down. Half a code of bias across a frame is free to remove.
-        let o = Output::new().with_dither(false);
+        let o = Output::new();
         let mut out = [0u8; 1];
         let value = Q16(((101i64 << 16) - 100) as i32 / 255);
         o.encode(&[value], 0, &mut out);

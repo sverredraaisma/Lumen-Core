@@ -148,18 +148,21 @@ typedef struct {
      * this design exists to avoid. */
     uint32_t phase;
 
-    /* Zero to dither, non-zero to round instead.
+    /* Non-zero to dither. Off by default, and usually the right default.
      *
-     * Dithering is worth having. Eight bits of linear PWM cannot represent
-     * anything below 1/255, so without it the dark end of every fade arrives in
-     * a few visible steps and then stops early - which reads as an effect that
-     * is wrong rather than a strip that is coarse.
+     * Dithering trades quantisation for flicker. Eight bits of linear PWM
+     * cannot represent anything below 1/255, so a fade ends slightly early
+     * without it - but a dithered pixel near half a code toggles between two
+     * codes, and at the 30 fps a show clock runs at that is a flicker around
+     * 15 Hz, which is close to the worst frequency there is for human vision.
+     * On a bare strip it reads as the hardware malfunctioning.
      *
-     * The three channels of a pixel share one threshold, so a dim grey stays
-     * grey. Dithering each channel on its own is the textbook arrangement and
-     * is wrong here: the three cross a code boundary on different frames and
-     * the dark end of a trail flashes red, then green, then blue. */
-    uint32_t no_dither;
+     * Turn it on for a device fast enough for the toggling to fuse, or one
+     * behind a diffuser. When it is on, the three channels of a pixel share one
+     * threshold so a dim grey stays grey - dithering each channel separately is
+     * the textbook arrangement and makes the dark end flash red, green and
+     * blue in turn. */
+    uint32_t dither;
 } LumenOutput;
 
 /* Turn a rendered frame into the bytes a strip consumes.

@@ -491,20 +491,16 @@ pub struct LumenOutput {
     /// counter: two devices dithering the same frame differently is the one
     /// disagreement this whole design is arranged to avoid.
     pub phase: u32,
-    /// Zero to dither, non-zero to round instead.
-    ///
-    /// Dithering is worth having. Eight bits of linear PWM cannot represent
-    /// anything below 1/255, so without it the dark end of a fade arrives in a
-    /// few visible steps and then stops early — which reads as an effect that is
-    /// wrong rather than a strip that is coarse. The three channels of a pixel
-    /// share one threshold, so a dim grey stays grey rather than flashing red,
-    /// green and blue in turn.
-    pub no_dither: u32,
+    /// Non-zero to dither. Off by default, and usually the right default:
+    /// at 30 fps a dithered pixel near half a code flickers at about 15 Hz,
+    /// which reads as a broken strip rather than a fade that ends early. See
+    /// the note on `lumen_vm::output`.
+    pub dither: u32,
 }
 
 impl LumenOutput {
     fn stage(&self) -> Output {
-        let mut output = Output::new().with_dither(self.no_dither == 0);
+        let mut output = Output::new().with_dither(self.dither != 0);
         if self.brightness_q16 > 0 {
             output.brightness = Q16(self.brightness_q16.min(Q16::ONE.0));
         }
