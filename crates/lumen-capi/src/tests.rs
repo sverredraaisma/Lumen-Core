@@ -330,7 +330,7 @@ fn a_short_datagram_is_not_a_header() {
 fn encoding_turns_linear_light_into_codes() {
     // Full scale must land exactly on 255. A white that comes out at 254 is a
     // strip that never reaches white.
-    let linear = [Q16::ONE.0, Q16::HALF.0, 0];
+    let linear = [Q16::ONE.0, Q16::ZERO.0, 0];
     let mut out = [0u8; 3];
     unsafe {
         assert_eq!(
@@ -346,7 +346,40 @@ fn encoding_turns_linear_light_into_codes() {
             LUMEN_OK
         );
     }
-    assert_eq!(out, [255, 128, 0]);
+    assert_eq!(out, [255, 0, 0]);
+}
+
+#[test]
+fn a_half_lands_between_two_codes_and_averages_to_the_middle() {
+    // 0.5 is 127.5 codes, which eight bits cannot hold. It alternates, and the
+    // average over the dither's period is the value that was asked for - which
+    // is the difference between a dimmer with 255 usable positions and one with
+    // 128.
+    let linear = [Q16::HALF.0; 3];
+    let mut out = [0u8; 3];
+    let mut sum = 0u32;
+    for phase in 0..16u32 {
+        let cfg = LumenOutput {
+            brightness_q16: 0,
+            budget_ma: 0,
+            phase,
+            no_dither: 0,
+        };
+        unsafe {
+            lumen_encode(
+                linear.as_ptr(),
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+                &cfg,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+        }
+        assert!(out[0] == 127 || out[0] == 128, "{}", out[0]);
+        sum += out[0] as u32;
+    }
+    assert_eq!(sum, 127 * 16 + 8, "averaged {}", sum / 16);
 }
 
 #[test]
@@ -358,7 +391,8 @@ fn a_null_config_is_the_working_default() {
     let zeroed = LumenOutput {
         brightness_q16: 0,
         budget_ma: 0,
-        residual: core::ptr::null_mut(),
+        phase: 0,
+        no_dither: 0,
     };
     unsafe {
         lumen_encode(
@@ -389,15 +423,15 @@ fn dithering_through_the_abi_reaches_a_value_below_one_code() {
     // ever without it, which is the bottom of every fade going missing.
     let half_code = Q16(Q16::ONE.0 / 510).0;
     let linear = [half_code; 3];
-    let mut residual = [0i32; 3];
     let mut out = [0u8; 3];
-    let cfg = LumenOutput {
-        brightness_q16: 0,
-        budget_ma: 0,
-        residual: residual.as_mut_ptr(),
-    };
     let mut lit = 0;
-    for _ in 0..10 {
+    for phase in 0..10 {
+        let cfg = LumenOutput {
+            brightness_q16: 0,
+            budget_ma: 0,
+            phase,
+            no_dither: 0,
+        };
         unsafe {
             lumen_encode(
                 linear.as_ptr(),
@@ -426,7 +460,8 @@ fn a_frame_over_its_supply_is_derated_and_says_so() {
     let cfg = LumenOutput {
         brightness_q16: 0,
         budget_ma: 500,
-        residual: core::ptr::null_mut(),
+        phase: 0,
+        no_dither: 1,
     };
     let (mut draw, mut derated) = (0u32, 0i32);
     unsafe {

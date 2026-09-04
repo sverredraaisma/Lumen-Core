@@ -340,11 +340,11 @@ pub unsafe extern "C" fn lumen_encode(
     let linear = core::slice::from_raw_parts(linear as *const Q16, channels);
     let out = core::slice::from_raw_parts_mut(rgb_out, channels);
 
-    let (stage, residual) = match output.as_ref() {
-        Some(cfg) => cfg.stage(channels),
-        None => (Output::new(), None),
+    let (stage, phase) = match output.as_ref() {
+        Some(cfg) => (cfg.stage(), cfg.phase),
+        None => (Output::new(), 0),
     };
-    let report = stage.encode(linear, residual, out);
+    let report = stage.encode(linear, phase, out);
 
     if let Some(p) = draw_ua_out.as_mut() {
         *p = report.draw_ua;
@@ -487,39 +487,31 @@ pub struct LumenOutput {
     /// that browns out mid-frame looks exactly like a driver that cannot hold
     /// one.
     pub budget_ma: u32,
-    /// Dither state: `count * 3` `int32_t`, zeroed at startup and carried
-    /// between frames. Null turns dithering off.
+    /// The frame number, which **must** come from show time rather than a local
+    /// counter: two devices dithering the same frame differently is the one
+    /// disagreement this whole design is arranged to avoid.
+    pub phase: u32,
+    /// Zero to dither, non-zero to round instead.
     ///
-    /// Worth providing. Without it every part of a value smaller than one code
-    /// in 255 is lost, so the dark end of a fade arrives in a few visible steps
-    /// and then stops early — which reads as an effect that is wrong rather than
-    /// a strip that is coarse.
-    pub residual: *mut i32,
+    /// Dithering is worth having. Eight bits of linear PWM cannot represent
+    /// anything below 1/255, so without it the dark end of a fade arrives in a
+    /// few visible steps and then stops early — which reads as an effect that is
+    /// wrong rather than a strip that is coarse. The three channels of a pixel
+    /// share one threshold, so a dim grey stays grey rather than flashing red,
+    /// green and blue in turn.
+    pub no_dither: u32,
 }
 
 impl LumenOutput {
-    /// The lifetime is the caller's, not this struct's: the residual is a
-    /// pointer the firmware owns and keeps between frames, and tying it to
-    /// `&self` would claim the config outlives it, which is backwards.
-    ///
-    /// # Safety
-    ///
-    /// `channels` must be the number of `int32_t` behind `self.residual`, and
-    /// they must live at least as long as `'a`.
-    unsafe fn stage<'a>(&self, channels: usize) -> (Output, Option<&'a mut [i32]>) {
-        let mut output = Output::new();
+    fn stage(&self) -> Output {
+        let mut output = Output::new().with_dither(self.no_dither == 0);
         if self.brightness_q16 > 0 {
             output.brightness = Q16(self.brightness_q16.min(Q16::ONE.0));
         }
         if self.budget_ma > 0 {
             output.power = Some(PowerModel::ws2812(self.budget_ma));
         }
-        let residual = if self.residual.is_null() {
-            None
-        } else {
-            Some(core::slice::from_raw_parts_mut(self.residual, channels))
-        };
-        (output, residual)
+        output
     }
 }
 

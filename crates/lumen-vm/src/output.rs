@@ -28,12 +28,29 @@
 //! steps and then stops early. That is what [`Output::encode`]'s dithering is
 //! for, and dithering fixes it without lying about what a number means.
 //!
-//! # Dithering is deterministic, and has to be
+//! # The three channels of a pixel round together
 //!
-//! The residual is carried between frames, so the same show fed to two devices
-//! produces the same codes on both. A random or time-seeded dither would make
+//! The first version of this diffused an error per channel, which is the
+//! textbook approach and is wrong here. Red, green and blue at the dark end of a
+//! fade sit at slightly different values - `#ecfbff` is (0.79, 0.96, 1.00) in
+//! linear light - so their errors accumulate at different rates and each crosses
+//! a code boundary on a different frame. The strip shows red, then green, then
+//! blue, where it should show a dim grey. It was visible on real hardware within
+//! a minute of shipping it.
+//!
+//! So the dither is **ordered, with one threshold per pixel per frame**, shared
+//! by that pixel's three channels. They cross together, the hue holds, and what
+//! is left is a dim pixel flickering rather than one changing colour.
+//!
+//! # And it is deterministic across devices
+//!
+//! The threshold comes from the frame's show time and the LED's index, both of
+//! which every device in a mesh agrees on. A locally-seeded dither would make
 //! two strips showing one gradient shimmer against each other, which is exactly
 //! the class of disagreement the rest of this project is arranged to prevent.
+//!
+//! Being ordered rather than error-diffused also means there is no state to
+//! carry: no residual buffer, and nothing to reset when a strip goes dark.
 
 use crate::q16::Q16;
 
@@ -84,6 +101,28 @@ pub struct Output {
     pub brightness: Q16,
     /// The supply, if this device knows about one.
     pub power: Option<PowerModel>,
+    /// Whether to dither. On by default; off costs the bottom of every fade.
+    pub dither: bool,
+}
+
+/// Where in the 0..1 interval this pixel's rounding threshold sits this frame.
+///
+/// A sixteen-frame sequence in bit-reversed order, so consecutive frames land at
+/// opposite ends of the interval rather than walking across it - a value that
+/// should be lit a quarter of the time is lit every fourth frame rather than four
+/// frames together, which is the difference between a shimmer and a blink.
+///
+/// Offset by the LED's index so neighbouring pixels do not fire in unison. A
+/// strip whose dark end blinks all at once is far more visible than one where
+/// the same amount of light is spread along it.
+fn threshold_for(led: usize, phase: u32) -> u32 {
+    const PERIOD: u32 = 16;
+    let k = phase.wrapping_add(led as u32 * 7) % PERIOD;
+    // Bit-reversal of a four-bit counter: 0, 8, 4, 12, 2, 10, ...
+    let reversed = ((k & 1) << 3) | ((k & 2) << 1) | ((k & 4) >> 1) | ((k & 8) >> 3);
+    // Half a step in, so the thresholds are centred on 1/32, 3/32, ... rather
+    // than starting at zero - which would round a value of exactly zero up.
+    (reversed * 2 + 1) * (65_536 / (PERIOD * 2))
 }
 
 impl Default for Output {
@@ -110,6 +149,7 @@ impl Output {
         Output {
             brightness: Q16::ONE,
             power: None,
+            dither: true,
         }
     }
 
@@ -123,6 +163,11 @@ impl Output {
         self
     }
 
+    pub const fn with_dither(mut self, dither: bool) -> Output {
+        self.dither = dither;
+        self
+    }
+
     /// Encode `linear` into `out`, carrying dither state in `residual`.
     ///
     /// All three are three entries per LED and must be the same length. A
@@ -130,25 +175,11 @@ impl Output {
     /// second on a device in somebody's ceiling, and dropping a frame's tail is a
     /// better outcome than dropping the device.
     ///
-    /// `residual` must persist between frames and start at zero. Reset it when
-    /// the strip goes dark, or the first frame after a blackout carries a
-    /// fraction of the last one.
-    ///
-    /// `None` turns dithering off and rounds to nearest instead. Everything
-    /// else (brightness, the power budget) still applies, so the two paths
-    /// differ only in what they do with the part of a value below one code.
-    /// Turning it off costs the bottom of every fade, and is there for a device
-    /// with no room for the state.
-    pub fn encode(
-        &self,
-        linear: &[Q16],
-        mut residual: Option<&mut [i32]>,
-        out: &mut [u8],
-    ) -> Encoded {
-        let n = match &residual {
-            Some(r) => linear.len().min(r.len()).min(out.len()),
-            None => linear.len().min(out.len()),
-        };
+    /// `phase` is the frame number, and must come from show time rather than a
+    /// local counter: two devices dithering the same frame differently is
+    /// exactly the disagreement this is arranged to avoid.
+    pub fn encode(&self, linear: &[Q16], phase: u32, out: &mut [u8]) -> Encoded {
+        let n = linear.len().min(out.len());
         let leds = n / CHANNELS;
 
         // Brightness first, then the supply. Both are global scalings and they
@@ -206,16 +237,17 @@ impl Output {
             // spare. `255` rather than `256`: full scale must land exactly on
             // 255 rather than one short of it.
             let target = scaled * 255;
-            let carried = residual.as_ref().map_or(0, |r| r[i]) as i64;
-            let acc = target + carried;
-            // Round to nearest, then keep what was thrown away. Over a few
-            // frames the average code equals the value asked for, which is how
-            // eight bits of linear PWM manages a fade that ends smoothly
-            // instead of in four visible steps.
-            let code = ((acc + 32_768) >> 16).clamp(0, 255);
-            if let Some(r) = residual.as_mut() {
-                r[i] = (acc - (code << 16)).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-            }
+            // One threshold per pixel, shared by its three channels, so they
+            // cross a code boundary on the same frame and the hue holds. Per
+            // channel - which is the textbook arrangement - the three cross on
+            // different frames and a dim grey comes out as red, then green,
+            // then blue.
+            let code = if self.dither {
+                let threshold = threshold_for(i / CHANNELS, phase) as i64;
+                ((target + threshold) >> 16).clamp(0, 255)
+            } else {
+                ((target + 32_768) >> 16).clamp(0, 255)
+            };
             out[i] = code as u8;
 
             if let Some(power) = self.power {
@@ -241,45 +273,65 @@ impl Output {
 mod tests {
     use super::*;
 
-    fn encode(out_stage: &Output, linear: &[Q16], residual: &mut [i32]) -> ([u8; 3], Encoded) {
+    fn encode(out_stage: &Output, linear: &[Q16], phase: u32) -> ([u8; 3], Encoded) {
         let mut bytes = [0u8; 3];
-        let report = out_stage.encode(linear, Some(residual), &mut bytes);
+        let report = out_stage.encode(linear, phase, &mut bytes);
         (bytes, report)
     }
 
     #[test]
     fn full_scale_is_full_scale_and_black_is_black() {
-        // The two values that must be exact. A white that comes out at 254 is a
-        // strip that never reaches white, and a black that dithers to 1 is a
-        // room that never goes dark.
+        // The two values that must be exact, on every frame of the dither
+        // sequence. A white that comes out at 254 is a strip that never reaches
+        // white, and a black that dithers to 1 is a room that never goes dark.
         let o = Output::new();
-        let mut residual = [0i32; 3];
-        let (bytes, _) = encode(&o, &[Q16::ONE; 3], &mut residual);
-        assert_eq!(bytes, [255, 255, 255]);
+        for phase in 0..64 {
+            assert_eq!(encode(&o, &[Q16::ONE; 3], phase).0, [255, 255, 255]);
+            assert_eq!(encode(&o, &[Q16::ZERO; 3], phase).0, [0, 0, 0]);
+        }
+    }
 
-        let mut residual = [0i32; 3];
-        for _ in 0..100 {
-            let (bytes, _) = encode(&o, &[Q16::ZERO; 3], &mut residual);
-            assert_eq!(bytes, [0, 0, 0], "black dithered");
+    #[test]
+    fn the_three_channels_of_a_pixel_cross_together() {
+        // The bug this dither exists to avoid, and the reason it is ordered
+        // rather than error-diffused. `#ecfbff` - a comet's tint - is three
+        // slightly different values, and diffusing an error per channel made
+        // them cross code boundaries on different frames: the dark end of the
+        // trail flashed red, then green, then blue instead of fading grey.
+        let o = Output::new();
+        let tint = [
+            Q16((0.79 * 65536.0) as i32 / 300),
+            Q16((0.96 * 65536.0) as i32 / 300),
+            Q16((1.00 * 65536.0) as i32 / 300),
+        ];
+        for phase in 0..64 {
+            let (bytes, _) = encode(&o, &tint, phase);
+            // Whenever anything is lit, the ordering of the channels holds:
+            // never blue alone while red is dark and green is not.
+            assert!(
+                bytes[0] <= bytes[1] && bytes[1] <= bytes[2],
+                "phase {phase}: {bytes:?} is not in tint order"
+            );
+            // And they are never more than one code apart, so the hue cannot
+            // swing to a primary.
+            assert!(
+                bytes[2] - bytes[0] <= 1,
+                "phase {phase}: {bytes:?} spans more than one code"
+            );
         }
     }
 
     #[test]
     fn a_value_below_one_code_is_reached_by_dithering() {
         // The whole point. Half a code is unrepresentable in eight bits, and
-        // without dithering it is either 0 or 1 for ever - which is why the dark
+        // without a dither it is either 0 or 1 for ever - which is why the dark
         // end of a fade ends in steps and then stops early.
         let o = Output::new();
-        let half_code = Q16(Q16::ONE.0 / 510); // half of 1/255
-        let mut residual = [0i32; 3];
-        let mut sum = 0u32;
-        const FRAMES: u32 = 100;
-        for _ in 0..FRAMES {
-            let (bytes, _) = encode(&o, &[half_code; 3], &mut residual);
-            sum += bytes[0] as u32;
-        }
-        // Half a code over a hundred frames is fifty codes' worth of light.
-        assert!((45..=55).contains(&sum), "got {sum}");
+        let half_code = Q16(Q16::ONE.0 / 510);
+        let sum: u32 = (0..32)
+            .map(|phase| encode(&o, &[half_code; 3], phase).0[0] as u32)
+            .sum();
+        assert!((14..=18).contains(&sum), "lit {sum} codes over 32 frames");
     }
 
     #[test]
@@ -287,42 +339,59 @@ mod tests {
         let o = Output::new();
         for numerator in 1..12u32 {
             let value = Q16((Q16::ONE.0 as i64 * numerator as i64 / 2550) as i32);
-            let mut residual = [0i32; 3];
-            let mut sum = 0i64;
-            const FRAMES: i64 = 200;
-            for _ in 0..FRAMES {
-                let (bytes, _) = encode(&o, &[value; 3], &mut residual);
-                sum += bytes[0] as i64;
-            }
-            let want = (value.0 as i64 * 255 * FRAMES) >> 16;
+            let sum: i64 = (0..64)
+                .map(|phase| encode(&o, &[value; 3], phase).0[0] as i64)
+                .sum();
+            let want = (value.0 as i64 * 255 * 64) >> 16;
             assert!(
-                (sum - want).abs() <= 2,
+                (sum - want).abs() <= 4,
                 "value {numerator}/2550: summed {sum}, wanted {want}"
             );
         }
     }
 
     #[test]
+    fn neighbouring_pixels_do_not_all_fire_on_the_same_frame() {
+        // A strip whose dark end blinks in unison is far more visible than one
+        // where the same light is spread along it.
+        let o = Output::new();
+        let dim = Q16(Q16::ONE.0 / 510);
+        const LEDS: usize = 10;
+        let linear = [dim; LEDS * CHANNELS];
+        let mut out = [0u8; LEDS * CHANNELS];
+        o.encode(&linear, 0, &mut out);
+
+        let lit = out.chunks(CHANNELS).filter(|px| px[0] > 0).count();
+        assert!(
+            (2..8).contains(&lit),
+            "{lit} of {LEDS} pixels lit on one frame: {out:?}"
+        );
+        // And each lit pixel is lit on all three channels, which is the whole
+        // reason the threshold is shared.
+        for px in out.chunks(CHANNELS) {
+            assert!(px[0] == px[1] && px[1] == px[2], "{px:?} is not grey");
+        }
+    }
+
+    #[test]
     fn two_devices_dither_identically() {
-        // Not a nicety. A random or time-seeded dither would make two strips
-        // showing one gradient shimmer against each other, which is the class of
-        // disagreement everything else in this project is arranged to prevent.
+        // Not a nicety. The threshold comes from show time and the LED index,
+        // both of which every device agrees on; a locally-seeded dither would
+        // make two strips showing one gradient shimmer against each other.
         let o = Output::new();
         let value = Q16(1_000);
-        let (mut a, mut b) = ([0i32; 3], [0i32; 3]);
-        for _ in 0..64 {
-            let (x, _) = encode(&o, &[value; 3], &mut a);
-            let (y, _) = encode(&o, &[value; 3], &mut b);
-            assert_eq!(x, y);
+        for phase in 0..64 {
+            assert_eq!(
+                encode(&o, &[value; 3], phase).0,
+                encode(&o, &[value; 3], phase).0
+            );
         }
     }
 
     #[test]
     fn brightness_scales_the_whole_frame() {
-        let o = Output::new().with_brightness(Q16::HALF);
-        let mut residual = [0i32; 3];
-        let (bytes, _) = encode(&o, &[Q16::ONE; 3], &mut residual);
-        assert_eq!(bytes, [128, 128, 128]);
+        let o = Output::new().with_brightness(Q16::HALF).with_dither(false);
+        assert_eq!(encode(&o, &[Q16::ONE; 3], 0).0, [128, 128, 128]);
     }
 
     #[test]
@@ -330,9 +399,8 @@ mod tests {
         // Thirty LEDs at full white is about 1.17 A; a 2 A supply covers it.
         let o = Output::new().with_power(PowerModel::ws2812(2_000));
         let linear = [Q16::ONE; 90];
-        let mut residual = [0i32; 90];
         let mut out = [0u8; 90];
-        let report = o.encode(&linear, Some(&mut residual), &mut out);
+        let report = o.encode(&linear, 0, &mut out);
         assert_eq!(report.derated_to, Q16::ONE);
         assert!(out.iter().all(|b| *b == 255));
         assert!(report.draw_ua < 2_000_000, "{}", report.draw_ua);
@@ -344,31 +412,33 @@ mod tests {
         // than losing its highlights, because clipping changes the colour of
         // exactly the parts somebody is looking at.
         let o = Output::new().with_power(PowerModel::ws2812(500));
-        // Sixty LEDs of full white: about 2.3 A against a 500 mA supply.
         let linear = [Q16::ONE; 180];
-        let mut residual = [0i32; 180];
         let mut out = [0u8; 180];
-        let report = o.encode(&linear, Some(&mut residual), &mut out);
+        let report = o.encode(&linear, 0, &mut out);
 
         assert!(report.derated_to < Q16::ONE, "not derated");
         assert!(report.draw_ua <= 500_000, "drew {}", report.draw_ua);
-        // Uniform: every channel took the same scaling, so white is still white.
-        let first = out[0];
-        assert!(out.iter().all(|b| *b == first), "not uniform");
-        assert!(first > 0 && first < 255, "{first}");
+        // Uniform to within the dither, so white is still white.
+        let (lo, hi) = (
+            *out.iter().min().expect("pixels"),
+            *out.iter().max().expect("pixels"),
+        );
+        assert!(hi - lo <= 1, "{lo}..{hi} is not uniform");
+        assert!(lo > 0 && hi < 255);
     }
 
     #[test]
     fn derating_keeps_the_colour_of_a_frame_that_is_not_white() {
-        let o = Output::new().with_power(PowerModel::ws2812(200));
+        let o = Output::new()
+            .with_power(PowerModel::ws2812(200))
+            .with_dither(false);
         let mut linear = [Q16::ZERO; 90];
         for led in 0..30 {
             linear[led * 3] = Q16::ONE;
             linear[led * 3 + 1] = Q16::HALF;
         }
-        let mut residual = [0i32; 90];
         let mut out = [0u8; 90];
-        o.encode(&linear, Some(&mut residual), &mut out);
+        o.encode(&linear, 0, &mut out);
 
         // Red is still twice green, and blue is still off.
         for led in 0..30 {
@@ -388,9 +458,8 @@ mod tests {
         // frame is better than browning out a board halfway through one.
         let o = Output::new().with_power(PowerModel::ws2812(100));
         let linear = [Q16::ONE; 900];
-        let mut residual = [0i32; 900];
         let mut out = [0u8; 900];
-        let report = o.encode(&linear, Some(&mut residual), &mut out);
+        let report = o.encode(&linear, 0, &mut out);
         assert_eq!(report.derated_to, Q16::ZERO);
         assert!(out.iter().all(|b| *b == 0));
     }
@@ -401,9 +470,8 @@ mod tests {
         // for a panic.
         let o = Output::new();
         let linear = [Q16::ONE; 9];
-        let mut residual = [0i32; 9];
         let mut out = [0u8; 3];
-        o.encode(&linear, Some(&mut residual), &mut out);
+        o.encode(&linear, 0, &mut out);
         assert_eq!(out, [255, 255, 255]);
     }
 
@@ -413,65 +481,28 @@ mod tests {
         // highlight that wrapped to black is the artefact everyone blames on the
         // strip.
         let o = Output::new();
-        let mut residual = [0i32; 3];
-        let (bytes, _) = encode(
-            &o,
-            &[Q16(Q16::ONE.0 * 4), Q16(-5_000), Q16::ONE],
-            &mut residual,
-        );
+        let (bytes, _) = encode(&o, &[Q16(Q16::ONE.0 * 4), Q16(-5_000), Q16::ONE], 0);
         assert_eq!(bytes, [255, 0, 255]);
     }
-}
-
-#[cfg(test)]
-mod undithered_tests {
-    use super::*;
 
     #[test]
     fn without_dither_a_value_below_one_code_is_lost() {
-        // The cost of turning it off, stated rather than implied. Half a code
-        // rounds to zero every frame and stays there, which is the bottom of
-        // every fade going missing.
-        let o = Output::new();
+        // The cost of turning it off, stated rather than implied.
+        let o = Output::new().with_dither(false);
         let half_code = Q16(Q16::ONE.0 / 510);
         let mut out = [0u8; 3];
-        o.encode(&[half_code; 3], None, &mut out);
+        o.encode(&[half_code; 3], 0, &mut out);
         assert_eq!(out, [0, 0, 0]);
-
-        // With it, the same value reaches the strip half the time.
-        let mut residual = [0i32; 3];
-        let lit = (0..10)
-            .filter(|_| {
-                o.encode(&[half_code; 3], Some(&mut residual), &mut out);
-                out[0] > 0
-            })
-            .count();
-        assert!((4..=6).contains(&lit), "lit on {lit} frames of ten");
-    }
-
-    #[test]
-    fn brightness_and_derating_still_apply_without_dither() {
-        // Only the sub-code part changes. A device with no room for the state
-        // must still not brown out its supply.
-        let o = Output::new().with_power(PowerModel::ws2812(500));
-        let linear = [Q16::ONE; 180];
-        let mut out = [0u8; 180];
-        let report = o.encode(&linear, None, &mut out);
-        assert!(report.derated_to < Q16::ONE);
-        assert!(report.draw_ua <= 500_000, "drew {}", report.draw_ua);
-        assert!(out.iter().all(|b| *b == out[0]));
     }
 
     #[test]
     fn rounding_is_to_nearest_rather_than_truncating() {
         // What the render loop used to do was `(v * 255) >> 16`, which always
-        // rounds down. Half a code of bias across a whole frame is free to
-        // remove and worth removing.
-        let o = Output::new();
+        // rounds down. Half a code of bias across a frame is free to remove.
+        let o = Output::new().with_dither(false);
         let mut out = [0u8; 1];
-        // 0.999 of a code above 100: truncation gives 100, nearest gives 101.
         let value = Q16(((101i64 << 16) - 100) as i32 / 255);
-        o.encode(&[value], None, &mut out);
+        o.encode(&[value], 0, &mut out);
         assert_eq!(out[0], 101);
     }
 }

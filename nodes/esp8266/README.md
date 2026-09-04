@@ -83,17 +83,17 @@ static LumenMachine *machine;
 static uint8_t program[2048];
 static size_t  program_len;
 
-/* Linear light, then the codes the strip consumes, then the dither state that
- * carries between frames. Three buffers because rendering and encoding are
- * separate jobs; at 60 LEDs that is 720 + 180 + 720 bytes. */
+/* Linear light, then the codes the strip consumes. Two buffers because
+ * rendering and encoding are separate jobs; at 60 LEDs that is 720 + 180
+ * bytes. The dither needs no state at all. */
 static int32_t linear[LEDS * LUMEN_BYTES_PER_PIXEL];
 static uint8_t pixels[LEDS * LUMEN_BYTES_PER_PIXEL];
-static int32_t residual[LEDS * LUMEN_BYTES_PER_PIXEL];
 
 static LumenOutput output = {
     .brightness_q16 = 0,      /* full */
     .budget_ma      = 500,    /* what a USB port promises without asking */
-    .residual       = residual,
+    .phase          = 0,      /* set per frame, from show time */
+    .no_dither      = 0,
 };
 
 void lumen_panic(void) {
@@ -136,6 +136,9 @@ void render(uint64_t now_us) {
                      LEDS, linear, sizeof linear) != LUMEN_OK) {
         return;
     }
+
+    /* From show time, so every device dithers this frame the same way. */
+    output.phase = (uint32_t)(now_us / 33333);
 
     uint32_t draw_ua = 0;
     if (lumen_encode(linear, LEDS, pixels, sizeof pixels,
@@ -190,12 +193,11 @@ taken its share:
 | machine storage | `lumen_machine_size()`, a few hundred |
 | a compiled program | 1–3 KB, whatever the controller pushed |
 | 60 LEDs of linear light | 720 |
-| 60 LEDs of dither state | 720 |
 | 60 LEDs of output | 180 |
 
-The dither state is optional — pass `NULL` and the library rounds instead — but
-it is the cheapest 720 bytes here. Without it nothing below 1/255 reaches the
-strip, so every fade ends in a few visible steps well before it reaches black.
+The dither costs no memory at all: it is ordered rather than error-diffused, so
+the threshold comes from the frame number and the LED's index instead of from a
+buffer carried between frames.
 
 That fits with room to spare. A strip long enough to worry about is one long
 enough to be worth a bigger chip.

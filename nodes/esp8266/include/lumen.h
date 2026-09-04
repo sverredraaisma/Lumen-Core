@@ -143,15 +143,23 @@ typedef struct {
      * keeps its colours. */
     uint32_t budget_ma;
 
-    /* Dither state: count * 3 int32_t, zeroed at startup and kept between
-     * frames. NULL turns dithering off.
+    /* The frame number. Take it from show time, not from a local counter:
+     * two devices dithering the same frame differently is the one disagreement
+     * this design exists to avoid. */
+    uint32_t phase;
+
+    /* Zero to dither, non-zero to round instead.
      *
-     * Worth providing. Eight bits of linear PWM cannot represent anything
-     * below 1/255, so without this the dark end of every fade arrives in a few
-     * visible steps and then stops early - which reads as an effect that is
-     * wrong rather than a strip that is coarse. The dither is deterministic, so
-     * two devices showing one gradient stay in step. */
-    int32_t *residual;
+     * Dithering is worth having. Eight bits of linear PWM cannot represent
+     * anything below 1/255, so without it the dark end of every fade arrives in
+     * a few visible steps and then stops early - which reads as an effect that
+     * is wrong rather than a strip that is coarse.
+     *
+     * The three channels of a pixel share one threshold, so a dim grey stays
+     * grey. Dithering each channel on its own is the textbook arrangement and
+     * is wrong here: the three cross a code boundary on different frames and
+     * the dark end of a trail flashes red, then green, then blue. */
+    uint32_t no_dither;
 } LumenOutput;
 
 /* Turn a rendered frame into the bytes a strip consumes.
