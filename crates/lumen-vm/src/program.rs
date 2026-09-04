@@ -246,6 +246,27 @@ impl<'a> Program<'a> {
         self.section(section).len() / INSTRUCTION_LEN
     }
 
+    /// What one run of a section costs, in [`crate::isa::OpCode::cost`] units.
+    ///
+    /// The same sum the compiler reports, recomputed from the bytecode - which
+    /// makes it available to a device that only ever received the program, and
+    /// keeps it honest if the two ever disagree.
+    ///
+    /// Exact rather than an estimate, because the compiler emits no loops:
+    /// `foreach` is unrolled, and that is precisely what keeps the budget answer
+    /// a compile-time one. A hand-written program using `Repeat` would cost more
+    /// than this says.
+    ///
+    /// The header's `budget` field is the `pixel` section only. Use this for the
+    /// others: charging the `frame` section against a per-pixel figure faults
+    /// every effect that hoists anything substantial, which is the whole reason
+    /// to hoist.
+    pub fn section_cost(&self, section: Section) -> u32 {
+        (0..self.section_len(section))
+            .filter_map(|i| self.instruction(section, i))
+            .fold(0u32, |acc, ins| acc.saturating_add(ins.op.cost()))
+    }
+
     /// One instruction, already validated at load.
     pub fn instruction(&self, section: Section, idx: usize) -> Option<Instruction> {
         let code = self.section(section);

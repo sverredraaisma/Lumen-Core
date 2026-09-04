@@ -1515,3 +1515,33 @@ fn a_pixel_kernel_with_no_arrays_at_all_faults_rather_than_reading_nothing() {
         "no arrays means no array to read"
     );
 }
+
+/// What one run of a section costs, which is what a device must charge the
+/// `frame` section rather than reusing the per-pixel figure from the header.
+#[test]
+fn a_section_costs_the_sum_of_its_instructions() {
+    use lumen_vm::isa::{Instruction, OpCode};
+    use lumen_vm::q16::Q16;
+
+    let mut b = ProgramBuilder::new();
+    let k = b.constant(Q16::ONE);
+    b.push(Section::Frame, Instruction::with_imm(OpCode::LoadK, 20, k));
+    b.push(Section::Frame, Instruction::new(OpCode::Sqrt, 21, 20, 0));
+    b.push(
+        Section::Pixel,
+        Instruction::new(OpCode::EmitRgb, 20, 20, 20),
+    );
+    let bytes = b.build();
+    let p = Program::parse(&bytes).unwrap();
+
+    assert_eq!(
+        p.section_cost(Section::Frame),
+        OpCode::LoadK.cost() + OpCode::Sqrt.cost()
+    );
+    // The header's `budget` is the pixel section alone. Here the frame section
+    // is the dearer of the two - the case a render loop charging one against
+    // the other gets wrong, and the shape of every effect that hoists well.
+    assert_eq!(p.section_cost(Section::Pixel), p.budget);
+    assert!(p.section_cost(Section::Frame) > p.budget);
+    assert_eq!(p.section_cost(Section::Once), 0);
+}
