@@ -88,6 +88,7 @@ Rendering cannot have the whole frame. A device also has to receive its channel 
 
 | Device | LEDs | fps | Units per pixel | Corpus effects that fit |
 |---|---|---|---|---|
+| ESP32-S3 @ 240 MHz | 300 | 60 | 449 | alert, breathe, plasma |
 | ESP32-C3 @ 160 MHz | 300 | 60 | 313 | alert, breathe |
 | ESP32-C3 @ 160 MHz | 150 | 60 | 647 | all five |
 | ESP32-C3 @ 160 MHz | 300 | 30 | 647 | all five |
@@ -95,7 +96,11 @@ Rendering cannot have the whole frame. A device also has to receive its channel 
 
 For scale, the five effects measured in S2 cost 136, 215, 388, 462 and 562 units per pixel.
 
-**So 300 LEDs at 60 fps on a C3 is real but tight.** The most expensive corpus effect uses 86% of the frame on its own, which leaves too little for the mesh. The honest statement of the C3's comfortable envelope is *300 LEDs at 30 fps, or 150 at 60*; 300 at 60 is available to simple effects and to a device doing nothing else. An S3 has not been measured. Scaling by clock alone suggests about 1.5x, but it is a different core and the number should be measured before anything is promised on it.
+**So 300 LEDs at 60 fps on a C3 is real but tight.** The most expensive corpus effect uses 86% of the frame on its own, which leaves too little for the mesh. The honest statement of the C3's comfortable envelope is *300 LEDs at 30 fps, or 150 at 60*; 300 at 60 is available to simple effects and to a device doing nothing else.
+
+**The S3 has now been measured, and the guess was right for the wrong reason.** At 240 MHz it runs the same corpus **1.4x faster** than the C3 — close to the 1.5x the clock ratio predicts — and the worst effect drops from 86% of a 60 fps frame to 60%. But the speedup is *entirely* the clock. Per instruction the S3 takes **583 ns against the C3's 838**, which at their respective clocks is **140 cycles against 134**: the Xtensa core is marginally *worse* per cycle than the RISC-V one, and its second core does nothing for a single-threaded interpreter.
+
+That is worth knowing before anyone reaches for a bigger chip to buy headroom. What a faster ESP32 buys is its clock and nothing else, and the clocks in this family span 160 to 240 MHz — a factor of 1.5, against a criterion that was out by a factor of ten.
 
 The editor should show this live as a budget bar per device, going red before you publish rather than after. Over budget offers three outs: lower fps for that device, simplify the effect, or move the device to bridge-rendered FRAMEs.
 
